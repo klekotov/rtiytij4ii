@@ -119,6 +119,9 @@ class FSMStates(StatesGroup):
     waiting_for_sponsor_channel_edit = State()  # для редактирования ссылки канала
     waiting_for_post_message = State()  # Новое состояние для ожидания сообщения рассылки
     waiting_for_file_action = State()  # Новое состояние для выбора действия с файлом
+    waiting_for_parse_games = State()  # Ожидание ID игр для парсинга платных GP / всех бейджей
+
+_LAST_PARSED_ITEMS: dict[int, dict[str, Any]] = {}
 async def create_invoice(user_id: int, plan: str):
     price = PLANS[plan]['price']
     days = PLANS[plan]['days']
@@ -1710,11 +1713,16 @@ def _build_games_menu_keyboard(
             game_row.append(InlineKeyboardButton(text="🔄", callback_data=f"{reset_prefix}{short}"))
         keyboard.inline_keyboard.append(game_row)
 
-    # Массовое переключение всех слотов
+    # Массовое переключение всех слотов + обновление названий из Roblox API
     keyboard.inline_keyboard.append([
         InlineKeyboardButton(text="✅ Вкл все", callback_data=f"bulk_{mode}_on"),
         InlineKeyboardButton(text="❌ Выкл все", callback_data=f"bulk_{mode}_off"),
+        InlineKeyboardButton(text="🔄 Названия", callback_data=f"refresh_names_{mode}"),
     ])
+
+    # Если какие-то названия ещё не подгрузились, запускаем фоновый до-резолв без блокировки UI
+    if any(str(info.get("name", "")).startswith("Game ") for info in GAMES.values()):
+        asyncio.create_task(cookie_processor.resolve_all_games_metadata())
 
     # Навигация по страницам
     if total_pages > 1:
@@ -1730,6 +1738,17 @@ def _build_games_menu_keyboard(
         InlineKeyboardButton(text=get_text(user_lang, "btn_back"), callback_data="settings")
     ])
     return keyboard, page, total_pages
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("refresh_names_"))
+async def refresh_game_names_handler(callback: types.CallbackQuery, state: FSMContext):
+    mode = callback.data.split("refresh_names_")[1]
+    await callback.answer("🔄 Загружаю названия игр из Roblox API...")
+    await cookie_processor.resolve_all_games_metadata()
+    if mode == "ingame":
+        await ingame_menu(callback, state)
+    else:
+        await playtime_menu(callback, state)
 
 
 @dp.callback_query(lambda c: c.data and c.data.startswith("noop_"))
@@ -1951,6 +1970,7 @@ async def badges_menu(callback: types.CallbackQuery, state: FSMContext):
         keyboard.inline_keyboard.append(_row)
 
     keyboard.inline_keyboard.extend([
+        [InlineKeyboardButton(text="🔍 Спарсить ВСЕ бейджи по ID игр", callback_data="parse_by_games_badges")],
         [InlineKeyboardButton(text=get_text(user_lang, "custom_badges_prompt").replace("📥 <b>", "").replace("</b>", ""), callback_data="custom_badges")],
         [InlineKeyboardButton(text=get_text(user_lang, "config_name_prompt_badges").replace("🆕 <b>", "").replace("</b>", ""), callback_data="create_config_badges")],
         [InlineKeyboardButton(text=get_text(user_lang, "btn_back"), callback_data="settings")]
@@ -1985,7 +2005,12 @@ async def process_custom_badges(message: Message, state: FSMContext):
     user_lang = await get_user_lang_from_state(state)
     
     try:
-        ids = [int(id.strip()) for id in re.split(r'[,\n]', message.text) if id.strip().isdigit()]
+        raw_text = message.text or ""
+        if message.document:
+            bio = BytesIO()
+            await bot.download(message.document, destination=bio)
+            raw_text = bio.getvalue().decode("utf-8", errors="ignore")
+        ids = [int(id.strip()) for id in re.split(r'[,\s]+', raw_text) if id.strip().isdigit()]
         if ids:
             config_name = f"Custom_{uuid.uuid4().hex[:8]}"
             add_user_custom_config(user_id, 'badges', config_name, ids)
@@ -2175,6 +2200,7 @@ async def gamepasses_menu(callback: types.CallbackQuery, state: FSMContext):
         keyboard.inline_keyboard.append(_row)
 
     keyboard.inline_keyboard.extend([
+        [InlineKeyboardButton(text="🔍 Спарсить ПЛАТНЫЕ GP по ID игр", callback_data="parse_by_games_gamepasses")],
         [InlineKeyboardButton(text=get_text(user_lang, "custom_gamepasses_prompt").replace("📥 <b>", "").replace("</b>", ""), callback_data="custom_gamepasses")],
         [InlineKeyboardButton(text=get_text(user_lang, "config_name_prompt_gamepasses").replace("🆕 <b>", "").replace("</b>", ""), callback_data="create_config_gamepasses")],
         [InlineKeyboardButton(text=get_text(user_lang, "btn_back"), callback_data="settings")]
@@ -2209,7 +2235,12 @@ async def process_custom_gamepasses(message: Message, state: FSMContext):
     user_lang = await get_user_lang_from_state(state)
     
     try:
-        ids = [int(id.strip()) for id in re.split(r'[,\n]', message.text) if id.strip().isdigit()]
+        raw_text = message.text or ""
+        if message.document:
+            bio = BytesIO()
+            await bot.download(message.document, destination=bio)
+            raw_text = bio.getvalue().decode("utf-8", errors="ignore")
+        ids = [int(id.strip()) for id in re.split(r'[,\s]+', raw_text) if id.strip().isdigit()]
         if ids:
             config_name = f"Custom_{uuid.uuid4().hex[:8]}"
             add_user_custom_config(user_id, 'gamepasses', config_name, ids)
@@ -2225,6 +2256,184 @@ async def process_custom_gamepasses(message: Message, state: FSMContext):
     
     await state.set_state(FSMStates.settings)
     await gamepasses_menu(types.CallbackQuery(message=message, data="gamepasses", from_user=message.from_user), state)
+
+
+async def _run_games_parser_and_reply(message: Message, raw_games_text: str, mode: str):
+    """Общий исполнитель парсинга платных геймпассов или всех бейджей по списку ID игр через запятую."""
+    user_id = message.from_user.id
+    is_gp = (mode == "gamepasses")
+    label = "ПЛАТНЫЕ Геймпассы" if is_gp else "ВСЕ Бейджи"
+    status_msg = await message.answer(
+        f"⏳ <b>Парсинг ({label})...</b>\nОпределяю Universe ID игр и собираю данные через Roblox API...",
+        parse_mode="HTML",
+    )
+
+    last_update_ts = [0.0]
+
+    async def _progress(done: int, total: int):
+        now = asyncio.get_event_loop().time()
+        if now - last_update_ts[0] < 3.0 and done < total:
+            return
+        last_update_ts[0] = now
+        try:
+            await status_msg.edit_text(
+                f"⏳ <b>Парсинг ({label})...</b>\nОбработано игр: <b>{done}/{total}</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    if is_gp:
+        res = await cookie_processor.fetch_paid_gamepasses_for_games(
+            raw_games_text, user_id=user_id, progress_cb=_progress
+        )
+        fname = "paid_gamepasses.txt"
+    else:
+        res = await cookie_processor.fetch_all_badges_for_games(
+            raw_games_text, user_id=user_id, progress_cb=_progress
+        )
+        fname = "all_badges.txt"
+
+    csv_str = res["csv"]
+    ids_list = res["ids"]
+    skipped = res["skipped_games"]
+    processed = res["processed_games"]
+    unresolved = res["unresolved_ids"]
+
+    _LAST_PARSED_ITEMS[user_id] = {"mode": mode, "ids": ids_list}
+
+    kb_rows = []
+    if ids_list:
+        kb_rows.append([
+            InlineKeyboardButton(
+                text=f"💾 Добавить эти {len(ids_list)} ID в чекер ({'GP' if is_gp else 'Бейджи'})",
+                callback_data=f"save_parsed_{mode}",
+            )
+        ])
+    kb_rows.append([
+        InlineKeyboardButton(text="🔙 Назад", callback_data="gamepasses" if is_gp else "badges")
+    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    summary = (
+        f"✅ <b>Готово — {label}</b>\n"
+        f"🎮 Обработано новых игр: <b>{len(processed)}</b>\n"
+        f"⏭ Пропущено (уже проверяются): <b>{len(skipped)}</b>\n"
+        f"🎯 Найдено уникальных ID: <b>{len(ids_list)}</b>"
+    )
+    if unresolved:
+        summary += f"\n⚠️ Не удалось распознать ID игр: <b>{len(unresolved)}</b>"
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    if not ids_list:
+        await message.answer(
+            summary + "\n\n<i>Новых ID не найдено (либо все переданные игры уже есть в проверке, либо нет платных GP/бейджей).</i>",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+        return
+
+    if len(csv_str) <= 3400:
+        await message.answer(
+            summary + f"\n\n<code>{csv_str}</code>",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    else:
+        doc = BufferedInputFile(csv_str.encode("utf-8"), filename=fname)
+        await message.answer_document(
+            document=doc,
+            caption=summary + "\n\n📎 <i>Список большой — отправлен файлом через запятую без лишнего текста.</i>",
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+
+
+@dp.callback_query(lambda c: c.data in ("parse_by_games_badges", "parse_by_games_gamepasses"))
+async def prompt_parse_by_games(callback: types.CallbackQuery, state: FSMContext):
+    mode = "gamepasses" if callback.data.endswith("gamepasses") else "badges"
+    await state.update_data(parse_items_mode=mode)
+    await state.set_state(FSMStates.waiting_for_parse_games)
+    target_desc = "ТОЛЬКО ПЛАТНЫХ геймпассов" if mode == "gamepasses" else "АБСОЛЮТНО ВСЕХ бейджей"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data="gamepasses" if mode == "gamepasses" else "badges")]
+    ])
+    await callback.message.edit_text(
+        f"🔍 <b>Парсинг {target_desc}</b>\n\n"
+        f"Отправьте <b>ID игр через запятую</b> сообщением или <code>.txt</code> файлом:\n"
+        f"<code>4872321990, 537413528, 301549746</code>\n\n"
+        f"<i>Игры, которые уже проверяются в боте, будут автоматически пропущены.</i>",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("getgp", "parsegp"))
+async def cmd_get_paid_gamepasses(message: Message, state: FSMContext):
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) > 1 and args[1].strip():
+        await _run_games_parser_and_reply(message, args[1], "gamepasses")
+        return
+    await state.update_data(parse_items_mode="gamepasses")
+    await state.set_state(FSMStates.waiting_for_parse_games)
+    await message.answer(
+        "🔍 <b>Парсинг ПЛАТНЫХ геймпассов</b>\n"
+        "Отправьте ID игр через запятую (текстом или <code>.txt</code> файлом):",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("getbadges", "parsebadges"))
+async def cmd_get_all_badges(message: Message, state: FSMContext):
+    args = (message.text or "").split(maxsplit=1)
+    if len(args) > 1 and args[1].strip():
+        await _run_games_parser_and_reply(message, args[1], "badges")
+        return
+    await state.update_data(parse_items_mode="badges")
+    await state.set_state(FSMStates.waiting_for_parse_games)
+    await message.answer(
+        "🔍 <b>Парсинг ВСЕХ бейджей</b>\n"
+        "Отправьте ID игр через запятую (текстом или <code>.txt</code> файлом):",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(FSMStates.waiting_for_parse_games)
+async def handle_waiting_for_parse_games(message: Message, state: FSMContext):
+    data = await state.get_data()
+    mode = data.get("parse_items_mode", "gamepasses")
+    raw_text = message.text or ""
+    if message.document:
+        bio = BytesIO()
+        await bot.download(message.document, destination=bio)
+        raw_text = bio.getvalue().decode("utf-8", errors="ignore")
+    await state.set_state(FSMStates.settings)
+    await _run_games_parser_and_reply(message, raw_text, mode)
+
+
+@dp.callback_query(lambda c: c.data in ("save_parsed_gamepasses", "save_parsed_badges"))
+async def save_parsed_items_to_checker(callback: types.CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    mode = "gamepasses" if callback.data.endswith("gamepasses") else "badges"
+    saved = _LAST_PARSED_ITEMS.get(user_id)
+    if not saved or saved.get("mode") != mode or not saved.get("ids"):
+        await callback.answer("❌ Нет сохранённого результата парсинга", show_alert=True)
+        return
+    ids = saved["ids"]
+    config_name = f"Parsed_{uuid.uuid4().hex[:6]}"
+    add_user_custom_config(user_id, mode, config_name, ids)
+    await load_and_merge_settings(user_id, state)
+    data = await state.get_data()
+    sel_key = "selected_gamepasses" if mode == "gamepasses" else "selected_badges"
+    sel = data.get(sel_key, {})
+    sel[config_name] = True
+    await state.update_data(**{sel_key: sel})
+    save_user_settings(user_id, await state.get_data())
+    await callback.answer(f"✅ Список {config_name} ({len(ids)} ID) добавлен и включён!", show_alert=True)
 @dp.callback_query(lambda c: c.data == "create_config_gamepasses")
 async def create_config_gamepasses(callback: types.CallbackQuery, state: FSMContext):
     user_lang = await get_user_lang_from_state(state)
@@ -4594,7 +4803,10 @@ async def handle_file_without_mode(message: Message, state: FSMContext):
         FSMStates.waiting_for_validation_file.state,
         FSMStates.waiting_for_file_action.state,
         FSMStates.waiting_for_cookie_files.state,
-        FSMStates.waiting_for_post_message.state
+        FSMStates.waiting_for_post_message.state,
+        FSMStates.waiting_for_parse_games.state,
+        FSMStates.waiting_for_custom_badges.state,
+        FSMStates.waiting_for_custom_gamepasses.state,
     ]:
         return
     
