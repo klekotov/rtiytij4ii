@@ -3697,51 +3697,31 @@ async def process_file(message: Message, state: FSMContext):
             filename = f"{uuid.uuid4()}.html"
             html_saved = save_stats_html(filename, html)
             url = get_stats_url(filename)
-            # --- Проверка доступности веб-отчёта (фикс ERR_CONNECTION_REFUSED) ---
+            # --- Проверка доступности веб-отчёта (bothost-aware, без хардкода :8001) ---
             html_path = os.path.join("temp", filename) if html_saved else None
-            web_accessible = html_saved  # по умолчанию считаем ок, но проверим локально
-            debug_hint = ""
+            web_accessible = bool(html_saved and html_path and os.path.isfile(html_path))
+            # определяем реальный порт сервера (bothost даёт PORT в env, иначе 8001)
+            _effective_port = 8001
             try:
-                import socket
-                # 1) Проверяем, слушает ли локально 127.0.0.1:8001
-                with socket.create_connection(("127.0.0.1", 8001), timeout=1.5):
-                    pass
-                # 2) Проверяем, что файл реально сохранился
-                if not html_path or not os.path.isfile(html_path):
-                    web_accessible = False
-                    debug_hint = "⚠️ HTML не сохранился на диск"
-                else:
-                    # Локальный GET к самому себе (без выхода в интернет)
-                    try:
-                        import aiohttp as _aio
-                        # делаем быструю проверку через 127.0.0.1, а не публичный IP (роутер может не пропускать loopback)
-                        # best-effort, не блокируем пользователя
-                        web_accessible = True
-                    except Exception:
-                        pass
-            except Exception as _e:
-                web_accessible = False
-                debug_hint = f"🔴 Веб-сервер 127.0.0.1:8001 не отвечает ({_e}). Отчёты по публичному IP {url} не откроются — порт закрыт фаерволом/роутером."
-                logging.warning(debug_hint)
-                logging.warning("Инструкция: Windows (админ PowerShell): netsh advfirewall firewall add rule name=RobloxChecker_Stats_8001 dir=in action=allow protocol=TCP localport=8001  | Linux: sudo ufw allow 8001/tcp  | + проброс порта 8001 на роутере (внешний 8001 → ПК:8001)")
-
-            if not web_accessible:
-                # Добавим подсказку прямо в текст отчёта, чтобы пользователь видел причину
-                hint_lang_ru = (
-                    "\n\n<blockquote>⚠️ <b>Веб-отчёт может не открыться (ERR_CONNECTION_REFUSED)</b> — порт <code>8001</code> закрыт.\n"
-                    "Исправь: <b>1)</b> запусти бота от имени администратора (Windows) / <code>sudo</code> (Linux), "
-                    "<b>2)</b> открой порт: <code>netsh advfirewall firewall add rule name=RobloxChecker_Stats_8001 dir=in action=allow protocol=TCP localport=8001</code> "
-                    "или <code>sudo ufw allow 8001/tcp</code>, "
-                    "<b>3)</b> на домашнем роутере пробрось порт 8001 на этот ПК. "
-                    "Пока веб недоступен — HTML отправлен файлом ниже.</blockquote>"
-                )
-                # Добавляем только для русского; для английского можно расширить, но пока универсально
-                stats_text = stats_text  # будет дополнен ниже после проверки языка, здесь заглушка — фактический текст добавим в клавиатуру/сообщение
-                # Сохраняем флаг, чтобы потом отправить html файлом
+                import os as _os2
+                for _env in ("PORT", "WEB_PORT", "SERVER_PORT", "APP_PORT"):
+                    _ev = _os2.getenv(_env)
+                    if _ev and _ev.isdigit():
+                        _effective_port = int(_ev)
+                        break
+            except Exception:
+                pass
+            if web_accessible:
                 try:
-                    await state.update_data(_last_html_path=html_path, _last_html_url=url)
-                except Exception:
-                    pass
+                    import socket
+                    with socket.create_connection(("127.0.0.1", _effective_port), timeout=1.5):
+                        pass
+                except Exception as _e:
+                    web_accessible = False
+                    logging.warning(f"🔴 Веб-сервер 127.0.0.1:{_effective_port} не отвечает ({_e}). Отчёты {url} не откроются — порт закрыт/не тот PORT.")
+                    logging.warning(f"Bothost: открой Веб-интерфейс в панели, порт панели = {_effective_port}; Локально: netsh advfirewall firewall add rule name=RobloxChecker_Stats_{_effective_port} dir=in action=allow protocol=TCP localport={_effective_port} | sudo ufw allow {_effective_port}/tcp")
+            else:
+                logging.warning("⚠️ HTML не сохранился на диск — веб-ссылка будет битой, отправим фолбек файлом")
      
             # ИСПРАВЛЕННЫЕ РАСЧЁТЫ СТАТИСТИКИ
             valid = summary['valid']
