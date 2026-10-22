@@ -58,8 +58,17 @@ def _resolve_temp_file_path(filename: str, allowed_exts: Set[str], require_exist
         return None
     return candidate
 
+async def handle_health(request):
+    return web.Response(text="OK", content_type="text/plain")
+
+async def handle_root(request):
+    return web.Response(text="228 Checker stats server running. Use /{uuid}.html for reports.", content_type="text/plain")
+
 async def handle_stats(request):
     filename = request.match_info.get('filename', '')
+    # health/root уже обработаны отдельными роутами, но на всякий случай
+    if filename in ("health", ""):
+        return web.Response(text="OK", content_type="text/plain")
     filepath = _resolve_temp_file_path(filename, _ALLOWED_STATS_EXTS, require_exists=True)
     if not filepath:
         return web.Response(status=404, text="Not Found")
@@ -156,43 +165,92 @@ async def handle_crypto_webhook(request):
         logging.error(traceback.format_exc())
         return web.Response(status=500)
 
+app.router.add_get('/health', handle_health)
+app.router.add_get('/', handle_root)
 app.router.add_get('/{filename}', handle_stats)
 app.router.add_post('/crypto_webhook', handle_crypto_webhook)
 
 def open_firewall_port(port: int):
     """
-    Открывает входящий TCP-порт в брандмауэре Windows (best-effort).
-    Требует прав администратора. Если прав нет — пишет инструкцию в лог.
+    Открывает входящий TCP-порт в брандмауэре (Windows + Linux best-effort).
+    Требует прав администратора/root. Если прав нет — пишет инструкцию в лог.
     """
     import platform
     import subprocess
-    if platform.system() != 'Windows':
-        return
+    import shutil
+    system = platform.system()
     rule_name = f"RobloxChecker_Stats_{port}"
-    try:
-        # Удаляем старое правило (если было) и создаём заново — идемпотентно
-        subprocess.run(
-            ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={rule_name}'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        result = subprocess.run(
-            ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
-             f'name={rule_name}', 'dir=in', 'action=allow',
-             'protocol=TCP', f'localport={port}'],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        if result.returncode == 0:
-            logging.info(f"🔓 Firewall: порт {port}/TCP открыт (правило '{rule_name}')")
-        else:
-            logging.warning(
-                f"⚠️ Не удалось открыть порт {port} в фаерволе (нужны права администратора). "
-                f"Открой вручную в PowerShell от админа:\n"
-                f"netsh advfirewall firewall add rule name={rule_name} dir=in action=allow protocol=TCP localport={port}"
+
+    # --- Windows ---
+    if system == 'Windows':
+        try:
+            subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={rule_name}'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
-    except Exception as e:
-        logging.warning(f"⚠️ Ошибка открытия порта в фаерволе: {e}")
+            result = subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                 f'name={rule_name}', 'dir=in', 'action=allow',
+                 'protocol=TCP', f'localport={port}'],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if result.returncode == 0:
+                logging.info(f"🔓 Firewall (Windows): порт {port}/TCP открыт (правило '{rule_name}')")
+            else:
+                err = result.stderr.decode('utf-8', errors='ignore') if result.stderr else ''
+                logging.warning(
+                    f"⚠️ Не удалось открыть порт {port} в фаерволе Windows (нужны права администратора). {err.strip()} "
+                    f"Открой вручную в PowerShell от админа: netsh advfirewall firewall add rule name={rule_name} dir=in action=allow protocol=TCP localport={port}"
+                )
+            return
+        except Exception as e:
+            logging.warning(f"⚠️ Ошибка открытия порта в фаерволе Windows: {e}")
+            return
+
+    # --- Linux ---
+    if system == 'Linux':
+        # 1) ufw
+        if shutil.which('ufw'):
+            try:
+                # ufw может спросить пароль — делаем best-effort без интерактива
+                result = subprocess.run(['ufw', 'allow', f'{port}/tcp'],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+                if result.returncode == 0:
+                    logging.info(f"🔓 Firewall (ufw): разрешён порт {port}/tcp")
+                    subprocess.run(['ufw', 'reload'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                    return
+                else:
+                    logging.info(f"ℹ️ ufw allow {port} не выполнен (нужен root): {result.stderr.strip()[:200]}")
+            except Exception as e:
+                logging.debug(f"ufw check failed: {e}")
+        # 2) firewalld
+        if shutil.which('firewall-cmd'):
+            try:
+                result = subprocess.run(['firewall-cmd', '--permanent', f'--add-port={port}/tcp'],
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+                if result.returncode == 0:
+                    subprocess.run(['firewall-cmd', '--reload'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                    logging.info(f"🔓 Firewall (firewalld): открыт порт {port}/tcp")
+                    return
+            except Exception as e:
+                logging.debug(f"firewalld check failed: {e}")
+        # 3) iptables (требует root, пишем инструкцию)
+        logging.info(f"ℹ️ Linux: проверь внешний фаервол вручную: sudo ufw allow {port}/tcp  ИЛИ  sudo iptables -I INPUT -p tcp --dport {port} -j ACCEPT")
+        # Проверяем, слушает ли вообще порт
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            s.connect(('127.0.0.1', port))
+            s.close()
+            logging.info(f"✅ Порт {port} уже слушается локально")
+        except Exception:
+            logging.warning(f"⚠️ Порт {port} не отвечает локально — сервер может не запуститься (занят или нет прав)")
+        return
+
+    logging.info(f"ℹ️ Авто-открытие фаервола для {system} не поддерживается — открой порт {port}/TCP вручную")
 
 async def get_public_ip():
     """Определяет внешний (публичный) IP машины через внешние сервисы."""
@@ -214,28 +272,71 @@ async def start_stats_server():
     port = 8001
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logging.info(f"🌐 Сервер отчётов слушает 0.0.0.0:{port}")
+    try:
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        logging.info(f"🌐 Сервер отчётов слушает 0.0.0.0:{port}")
+    except OSError as e:
+        logging.error(f"❌ Не удалось запустить сервер отчётов на порту {port}: {e}")
+        logging.error(f"   Проверь, не занят ли порт: Windows: netstat -ano | findstr :{port}  Linux: sudo ss -tulpn | grep {port}")
+        # Пытаемся всё равно продолжить, но ссылки будут битые
+        return config.stats_public_url
 
-    # Открываем порт в брандмауэре Windows
+    # Открываем порт в брандмауэре (Windows / Linux)
     open_firewall_port(port)
 
     # Определяем хост для ссылок: ручной override (config.STATS_HOST) или внешний IP
+    # Если STATS_HOST = None или пусто — авто-определяем
     host = getattr(config, 'STATS_HOST', None)
+    if isinstance(host, str):
+        host = host.strip()
+        if not host:
+            host = None
     if not host:
-        host = await get_public_ip()
+        detected = await get_public_ip()
+        if detected:
+            host = detected
+            logging.info(f"🔍 Авто-определён внешний IP: {host}")
+        else:
+            host = None
 
     if host:
         config.stats_public_url = f"http://{host}:{port}"
         logging.info(f"📊 URL отчётов: {config.stats_public_url}")
-        logging.info(f"   ⚠️ Для доступа из интернета пробрось порт {port} на роутере (внешний {port} → этот ПК:{port})")
+        # Если хост — приватный (192.168.x, 10.x, 172.16.x) — сразу предупреждаем
+        is_private = host.startswith(('192.168.', '10.', '172.')) or host in ('127.0.0.1', 'localhost')
+        if is_private:
+            logging.warning(
+                f"⚠️ STATS_HOST={host} — это приватный IP, из интернета по нему не зайти! "
+                f"Укажи публичный IP в config.py: STATS_HOST = \"ТВОЙ_ПУБЛИЧНЫЙ_IP\" или оставь None для авто-определения. "
+                f"Для домашнего ПК нужен проброс порта {port} на роутере."
+            )
+        else:
+            logging.info(f"   ℹ️ Если отчёт не открывается (ERR_CONNECTION_REFUSED) — проверь: 1) фаервол Windows/Linux разрешил {port}/TCP, "
+                         f"2) на роутере проброшен порт {port} (внешний {port} → этот ПК:{port}), 3) провайдер не блокирует входящие. "
+                         f"Временный обход: бот также отправит HTML-файл напрямую, если веб-ссылка недоступна.")
+        # Локальная проверка доступности (127.0.0.1)
+        try:
+            import socket
+            with socket.create_connection(("127.0.0.1", port), timeout=2):
+                logging.info(f"✅ Локальная проверка: 127.0.0.1:{port} доступен")
+        except Exception as e:
+            logging.warning(f"⚠️ Локальная проверка 127.0.0.1:{port} не прошла: {e}")
     else:
         logging.warning(
-            "⚠️ Не удалось определить публичный IP. Отчёты могут быть недоступны.\n"
-            "   Задай IP вручную в config.py: STATS_HOST = \"ТВОЙ_ВНЕШНИЙ_IP\""
+            "⚠️ Не удалось определить публичный IP. Веб-отчёты будут недоступны по внешней ссылке.\n"
+            "   Задай IP вручную в config.py: STATS_HOST = \"ТВОЙ_ВНЕШНИЙ_IP\"  или проверь интернет."
         )
     return config.stats_public_url
+
+async def check_stats_accessible(url: str, timeout: float = 3.0) -> bool:
+    """Проверяет, открывается ли URL отчётов извне (best-effort)."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                return resp.status in (200, 304)
+    except Exception:
+        return False
 
 def save_stats_html(filename: str, html_content: str) -> bool:
     try:
