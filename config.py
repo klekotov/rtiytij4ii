@@ -672,10 +672,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </body>
 </html>"""
 TEMP_DIR = "temp"
-# Хост для ссылок на отчёты. None = автоопределение внешнего IP при старте.
-# Задай вручную строкой (напр. "85.142.10.5"), если автоопределение не подходит.
-STATS_HOST = "147.45.230.226"
-stats_public_url = "http://127.0.0.1:8001"  # перезаписывается в start_stats_server()
+# Хост для ссылок на отчёты. None = автоопределение. Можно указать IP, домен или полный URL.
+# Примеры:
+#   STATS_HOST = None                      # авто-определит публичный IP (подходит не для bothost.ru)
+#   STATS_HOST = "147.45.230.226"          # старый вариант — прямой IP:8001 (требует открытый порт/проброс)
+#   STATS_HOST = "mybot.bothost.tech"      # ✅ для bothost.ru — вкл. Веб-интерфейс в панели, укажи выданный домен
+#   STATS_HOST = "mydomain.com"            # свой домен (A-запись → IP хоста, порт 8001 должен быть открыт)
+#   STATS_HOST = "https://mydomain.com"    # если стоит Nginx/Cloudflare с HTTPS без порта
+STATS_HOST = "bot-1792475546-1397-s4234sfdsfsdf.bothost.tech"  # bothost.ru домен для этого бота (выдаёт панель → Веб-интерфейс)
+stats_public_url = "http://127.0.0.1:8001"  # перезаписывается в start_stats_server() / из PORT env → https://bot-1792475546-1397...
 CHECK_PARAMS = {
     'price': 'Price ($)',
     'balance': 'Balance',

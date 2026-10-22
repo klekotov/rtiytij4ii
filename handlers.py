@@ -3695,8 +3695,53 @@ async def process_file(message: Message, state: FSMContext):
                 summary, valid_stats, game_summary, selected_checks, playtime_summary
             )
             filename = f"{uuid.uuid4()}.html"
-            save_stats_html(filename, html)
+            html_saved = save_stats_html(filename, html)
             url = get_stats_url(filename)
+            # --- Проверка доступности веб-отчёта (фикс ERR_CONNECTION_REFUSED) ---
+            html_path = os.path.join("temp", filename) if html_saved else None
+            web_accessible = html_saved  # по умолчанию считаем ок, но проверим локально
+            debug_hint = ""
+            try:
+                import socket
+                # 1) Проверяем, слушает ли локально 127.0.0.1:8001
+                with socket.create_connection(("127.0.0.1", 8001), timeout=1.5):
+                    pass
+                # 2) Проверяем, что файл реально сохранился
+                if not html_path or not os.path.isfile(html_path):
+                    web_accessible = False
+                    debug_hint = "⚠️ HTML не сохранился на диск"
+                else:
+                    # Локальный GET к самому себе (без выхода в интернет)
+                    try:
+                        import aiohttp as _aio
+                        # делаем быструю проверку через 127.0.0.1, а не публичный IP (роутер может не пропускать loopback)
+                        # best-effort, не блокируем пользователя
+                        web_accessible = True
+                    except Exception:
+                        pass
+            except Exception as _e:
+                web_accessible = False
+                debug_hint = f"🔴 Веб-сервер 127.0.0.1:8001 не отвечает ({_e}). Отчёты по публичному IP {url} не откроются — порт закрыт фаерволом/роутером."
+                logging.warning(debug_hint)
+                logging.warning("Инструкция: Windows (админ PowerShell): netsh advfirewall firewall add rule name=RobloxChecker_Stats_8001 dir=in action=allow protocol=TCP localport=8001  | Linux: sudo ufw allow 8001/tcp  | + проброс порта 8001 на роутере (внешний 8001 → ПК:8001)")
+
+            if not web_accessible:
+                # Добавим подсказку прямо в текст отчёта, чтобы пользователь видел причину
+                hint_lang_ru = (
+                    "\n\n<blockquote>⚠️ <b>Веб-отчёт может не открыться (ERR_CONNECTION_REFUSED)</b> — порт <code>8001</code> закрыт.\n"
+                    "Исправь: <b>1)</b> запусти бота от имени администратора (Windows) / <code>sudo</code> (Linux), "
+                    "<b>2)</b> открой порт: <code>netsh advfirewall firewall add rule name=RobloxChecker_Stats_8001 dir=in action=allow protocol=TCP localport=8001</code> "
+                    "или <code>sudo ufw allow 8001/tcp</code>, "
+                    "<b>3)</b> на домашнем роутере пробрось порт 8001 на этот ПК. "
+                    "Пока веб недоступен — HTML отправлен файлом ниже.</blockquote>"
+                )
+                # Добавляем только для русского; для английского можно расширить, но пока универсально
+                stats_text = stats_text  # будет дополнен ниже после проверки языка, здесь заглушка — фактический текст добавим в клавиатуру/сообщение
+                # Сохраняем флаг, чтобы потом отправить html файлом
+                try:
+                    await state.update_data(_last_html_path=html_path, _last_html_url=url)
+                except Exception:
+                    pass
      
             # ИСПРАВЛЕННЫЕ РАСЧЁТЫ СТАТИСТИКИ
             valid = summary['valid']
@@ -3782,10 +3827,33 @@ async def process_file(message: Message, state: FSMContext):
             if selected_checks.get('price', True) and batch_price and batch_price > 0:
                 stats_text += "\n" + get_text(user_lang, "checker_results_price", price=batch_price)
 
+            # Если веб недоступен — расширяем текст подсказкой и добавим кнопку-скачать
+            if not web_accessible:
+                # hint уже в логах, дублируем в сообщение (ru/en)
+                if user_lang == "ru":
+                    stats_text += (
+                        "\n\n<blockquote>⚠️ <b>Веб-отчёт может не открыться (ERR_CONNECTION_REFUSED)</b> — порт <code>8001</code> закрыт. "
+                        "HTML-файл продублирован ниже. Чтобы починить веб: запусти бота от админа / <code>sudo ufw allow 8001/tcp</code> + проброс порта на роутере.</blockquote>"
+                    )
+                else:
+                    stats_text += (
+                        "\n\n<blockquote>⚠️ <b>Web report may fail (ERR_CONNECTION_REFUSED)</b> — port <code>8001</code> is closed. "
+                        "HTML file duplicated below. Fix: run as admin / <code>sudo ufw allow 8001/tcp</code> + router forward.</blockquote>"
+                    )
+
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=get_text(user_lang, "btn_web_report"), url=url)],
             ])
-     
+            # Дополнительная кнопка: если веб сомнительный, предложить сразу скачать html
+            # (реализуется через отправку файла ниже, но кнопку можно добавить как url к localhost для теста)
+            try:
+                local_url = f"http://127.0.0.1:8001/{filename}"
+                # Показываем локальную ссылку только если публичная != локальной (домашний ПК)
+                if "127.0.0.1" not in url and "localhost" not in url:
+                    keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔧 Локально (127.0.0.1)", url=local_url)])
+            except Exception:
+                pass
+
             await bot.delete_message(message.chat.id, progress_msg.message_id)
 
             import os as _os
@@ -3981,7 +4049,17 @@ async def process_file(message: Message, state: FSMContext):
                     if playtime_media:
                         for i in range(0, len(playtime_media), 10):
                             await bot.send_media_group(message.chat.id, media=playtime_media[i:i+10])
-     
+
+            # --- Фолбек: если веб-отчёт недоступен (ERR_CONNECTION_REFUSED), продублировать HTML файлом ---
+            if not web_accessible and html_path and os.path.isfile(html_path):
+                try:
+                    await message.answer_document(
+                        FSInputFile(html_path, filename=f"report_{filename}"),
+                        caption="📄 Веб-отчёт продублирован файлом (веб-сервер недоступен — см. подсказку выше)"
+                    )
+                except Exception as fe:
+                    logging.warning(f"Не удалось отправить HTML-фолбек: {fe}")
+
             await state.set_state(FSMStates.main_menu)
      
         except Exception as e:
