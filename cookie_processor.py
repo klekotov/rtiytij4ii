@@ -36,7 +36,8 @@ from config import (PRICE_PER_1K_ROBUX, PRICE_GROUP_DISCOUNT, PRICE_PER_1K_RAP, 
                     PRICE_KORBLOX, PRICE_KORBLOX_DISCOUNT, PRICE_HEADLESS, PRICE_HEADLESS_DISCOUNT,
                     PRICE_COMBO, PRICE_COMBO_DISCOUNT, PRICE_PREMIUM, PRICE_ACTIVE_MIN_MINUTES)
 from proxy_pool import ProxyPool
-from database import get_user_custom_configs
+from database import get_user_custom_configs, get_all_cached_places, save_cached_place
+import html as _html_lib
 # Прокси хелпер — 407 fix (webshare http: требует proxy_auth отдельно)
 try:
     from utils import get_proxy_aiohttp_params
@@ -556,7 +557,8 @@ class CookieProcessor:
     
     async def get_donate_period(self, session: aiohttp.ClientSession, cookie: str, user_id: int, proxy_url: str, 
                                 days: Optional[int] = None, return_gamepasses: bool = False, 
-                                return_game_donates: bool = False, place_to_name: dict = None) -> Dict[str, Any]:
+                                return_game_donates: bool = False, place_to_name: dict = None,
+                                universe_to_name: dict = None) -> Dict[str, Any]:
         from collections import defaultdict
         
         result = {
@@ -604,13 +606,26 @@ class CookieProcessor:
                                     if gp_id:
                                         result['gamepasses'].add(gp_id)
 
-                                # InGame Donate — используем place_to_name только если передан и return_game_donates=True
+                                # InGame Donate — матчим и по placeId, и по universeId (учитывает sub-places: 2nd/3rd Sea и т.д.)
                                 if return_game_donates:
-                                    place_id = tx.get('details', {}).get('place', {}).get('placeId')
+                                    place_obj = tx.get('details', {}).get('place') or {}
+                                    place_id = place_obj.get('placeId')
+                                    tx_universe_id = place_obj.get('universeId')
+                                    tx_place_name = (place_obj.get('name') or '').strip()
+                                    matched_name = None
                                     if place_id and place_to_name and place_id in place_to_name:
-                                        name = place_to_name[place_id]
-                                        result['game_donates'][name]['sum'] += abs(amount)
-                                        result['game_donates'][name]['count'] += 1
+                                        matched_name = place_to_name[place_id]
+                                    elif tx_universe_id and universe_to_name and tx_universe_id in universe_to_name:
+                                        matched_name = universe_to_name[tx_universe_id]
+                                    if matched_name and amount < 0:
+                                        if matched_name.startswith("Game ") and tx_place_name:
+                                            matched_name = tx_place_name
+                                            if place_id and place_to_name is not None:
+                                                place_to_name[place_id] = tx_place_name
+                                            if tx_universe_id and universe_to_name is not None:
+                                                universe_to_name[tx_universe_id] = tx_place_name
+                                        result['game_donates'][matched_name]['sum'] += abs(amount)
+                                        result['game_donates'][matched_name]['count'] += 1
 
                             cursor = data.get('nextPageCursor')
                             page_done = True
@@ -753,18 +768,20 @@ class CookieProcessor:
         custom_badges = get_user_custom_configs(user_id, 'badges')
         custom_gamepasses = get_user_custom_configs(user_id, 'gamepasses')
         
-        # Используем переданные словари игр с переопределениями
+        # Используем переданные словари игр с переопределениями (пустые слоты без ID пропускаем)
         selected_ingame_games = {}
         selected_playtime_games = {}
     
         for short in GAMES:
             if selected_ingame.get(short, False):
                 game_info = ingame_games.get(short, GAMES[short]).copy()
-                selected_ingame_games[short] = game_info
+                if game_info.get('place_id') or game_info.get('universe_id'):
+                    selected_ingame_games[short] = game_info
         
             if selected_playtime.get(short, False):
                 game_info = playtime_games.get(short, GAMES[short]).copy()
-                selected_playtime_games[short] = game_info
+                if game_info.get('place_id') or game_info.get('universe_id'):
+                    selected_playtime_games[short] = game_info
 
         result = {
             'valid': True,
@@ -836,7 +853,19 @@ class CookieProcessor:
                     selected_checks.get('ingame_donate', False) or
                     selected_checks.get('gamepasses', False)):
                     async def _donate_task():
-                        place_to_name = {info['place_id']: info['name'] for info in selected_ingame_games.values()}
+                        place_to_name = {}
+                        universe_to_name = {}
+                        for info in selected_ingame_games.values():
+                            gname = info['name']
+                            if info.get('place_id'):
+                                place_to_name[info['place_id']] = gname
+                            if info.get('root_place_id'):
+                                place_to_name[info['root_place_id']] = gname
+                            if info.get('universe_id'):
+                                universe_to_name[info['universe_id']] = gname
+                            elif info.get('place_id'):
+                                # На случай если в конфиг передан universeId до авто-резолва
+                                universe_to_name.setdefault(info['place_id'], gname)
                         data = await self.get_donate_period(
                             session=session,
                             cookie=cookie,
@@ -845,7 +874,8 @@ class CookieProcessor:
                             days=None,
                             return_gamepasses=selected_checks.get('gamepasses', False),
                             return_game_donates=selected_checks.get('ingame_donate', False),
-                            place_to_name=place_to_name if selected_checks.get('ingame_donate', False) else None
+                            place_to_name=place_to_name if selected_checks.get('ingame_donate', False) else None,
+                            universe_to_name=universe_to_name if selected_checks.get('ingame_donate', False) else None,
                         )
                         if selected_checks.get('donate_lifetime', False):
                             result['donate_lifetime'] = data['total']
@@ -1408,6 +1438,23 @@ class CookieProcessor:
                                             'universe_id': universe_id,
                                             'place_id': place_id
                                         }
+
+                # 3. Фолбек: если передан не place_id, а сразу universe_id
+                async with session.get(
+                    f"https://games.roblox.com/v1/games?universeIds={place_id}",
+                    headers={"Accept": "application/json"}
+                ) as uni_resp:
+                    if uni_resp.status == 200:
+                        uni_data = await uni_resp.json()
+                        if uni_data.get('data'):
+                            ginfo = uni_data['data'][0]
+                            root_pid = ginfo.get('rootPlaceId') or place_id
+                            return {
+                                'name': ginfo.get('name', f'Game {place_id}'),
+                                'universe_id': ginfo.get('id', place_id),
+                                'place_id': root_pid,
+                                'root_place_id': root_pid,
+                            }
         
         except aiohttp.ClientError as e:
             logging.error(f"Ошибка сети при получении информации об игре {place_id}: {e}")
@@ -1415,6 +1462,127 @@ class CookieProcessor:
             logging.error(f"Ошибка получения информации об игре {place_id}: {e}")
         
         return None
+
+    async def resolve_all_games_metadata(self) -> int:
+        """
+        Подгружает из SQLite-кэша и (для ещё не закэшированных ID) из Roblox API
+        точные названия игр и universe_id для всех слотов в config.GAMES.
+        Поддерживает как place_id, так и universe_id.
+        """
+        cached = get_all_cached_places()
+        unresolved: List[Tuple[str, int]] = []
+        applied_from_cache = 0
+
+        for short, info in GAMES.items():
+            raw_id = info.get('raw_id') or info.get('place_id')
+            if not raw_id:
+                continue
+            if raw_id in cached:
+                c = cached[raw_id]
+                if c.get('name'):
+                    info['name'] = c['name']
+                if c.get('place_id'):
+                    info['place_id'] = c['place_id']
+                if c.get('universe_id'):
+                    info['universe_id'] = c['universe_id']
+                    UNIVERSE_IDS[short] = c['universe_id']
+                applied_from_cache += 1
+            elif not info.get('universe_id') or str(info.get('name', '')).startswith('Game '):
+                unresolved.append((short, int(raw_id)))
+
+        if applied_from_cache:
+            logging.info(f"🎮 Загружено из кэша БД: {applied_from_cache} игр")
+        if not unresolved:
+            return applied_from_cache
+
+        logging.info(f"🔄 Авто-резолв названий и universe_id для {len(unresolved)} Roblox игр...")
+        sem = asyncio.Semaphore(12)
+        resolved_universe_by_short: Dict[str, Tuple[int, int]] = {}
+        fallback_universe_candidates: List[Tuple[str, int]] = []
+
+        try:
+            connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=20)
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                async def _fetch_universe(short_code: str, pid: int):
+                    async with sem:
+                        for attempt in range(2):
+                            px = self._next_fresher_proxy(None) if attempt == 1 else None
+                            px_kwargs = get_proxy_aiohttp_params(px) if px else {}
+                            try:
+                                async with session.get(
+                                    f"https://apis.roblox.com/universes/v1/places/{pid}/universe",
+                                    headers={"Accept": "application/json"},
+                                    **px_kwargs,
+                                ) as r:
+                                    if r.status == 200:
+                                        data = await r.json()
+                                        uid = data.get("universeId")
+                                        if uid:
+                                            resolved_universe_by_short[short_code] = (pid, int(uid))
+                                            return
+                                        fallback_universe_candidates.append((short_code, pid))
+                                        return
+                            except Exception:
+                                continue
+
+                await asyncio.gather(*(_fetch_universe(s, pid) for s, pid in unresolved))
+
+                # Пакетно запрашиваем названия всех найденных universeId (до 50 за 1 запрос)
+                uid_to_meta: Dict[int, Dict[str, Any]] = {}
+                all_uids = list({uid for _, uid in resolved_universe_by_short.values()} | {pid for _, pid in fallback_universe_candidates})
+                for i in range(0, len(all_uids), 50):
+                    batch = all_uids[i:i + 50]
+                    joined = ",".join(str(u) for u in batch)
+                    for attempt in range(2):
+                        px = self._next_fresher_proxy(None) if attempt == 1 else None
+                        px_kwargs = get_proxy_aiohttp_params(px) if px else {}
+                        try:
+                            async with session.get(
+                                f"https://games.roblox.com/v1/games?universeIds={joined}",
+                                headers={"Accept": "application/json"},
+                                **px_kwargs,
+                            ) as gr:
+                                if gr.status == 200:
+                                    gdata = await gr.json()
+                                    for item in gdata.get("data", []):
+                                        if item.get("id"):
+                                            uid_to_meta[int(item["id"])] = item
+                                    break
+                        except Exception:
+                            continue
+
+                newly_resolved = 0
+                for short_code, (orig_pid, uid) in resolved_universe_by_short.items():
+                    meta = uid_to_meta.get(uid, {})
+                    gname = (meta.get("name") or GAMES[short_code]["name"]).strip()
+                    root_pid = meta.get("rootPlaceId")
+                    GAMES[short_code]["name"] = gname
+                    GAMES[short_code]["universe_id"] = uid
+                    if root_pid:
+                        GAMES[short_code]["root_place_id"] = int(root_pid)
+                    UNIVERSE_IDS[short_code] = uid
+                    save_cached_place(orig_pid, gname, orig_pid, uid)
+                    newly_resolved += 1
+
+                for short_code, raw_uid in fallback_universe_candidates:
+                    meta = uid_to_meta.get(raw_uid)
+                    if meta:
+                        gname = (meta.get("name") or GAMES[short_code]["name"]).strip()
+                        root_pid = int(meta.get("rootPlaceId") or raw_uid)
+                        GAMES[short_code]["name"] = gname
+                        GAMES[short_code]["place_id"] = root_pid
+                        GAMES[short_code]["root_place_id"] = root_pid
+                        GAMES[short_code]["universe_id"] = raw_uid
+                        UNIVERSE_IDS[short_code] = raw_uid
+                        save_cached_place(raw_uid, gname, root_pid, raw_uid)
+                        newly_resolved += 1
+
+                logging.info(f"✅ Авто-резолв игр завершён: {newly_resolved}/{len(unresolved)} обновлено и сохранено в БД")
+                return applied_from_cache + newly_resolved
+        except Exception as e:
+            logging.warning(f"⚠️ Авто-резолв метаданных игр завершился частично: {e}")
+            return applied_from_cache
     RARE_ITEM_PATTERNS = [
         'valkyrie', 'valk',
         '8 bit crown', '8-bit crown', '8 bit royal crown', '8-bit royal crown',
@@ -2105,14 +2273,17 @@ class CookieProcessor:
         summary = defaultdict(int)
         for stat in stats:
             for name, data in stat.get('game_donates', {}).items():
-                summary[name] += data['sum']
+                amt = data.get('sum', 0) if isinstance(data, dict) else data
+                if amt > 0:
+                    summary[name] += amt
         return dict(summary)
 
     def compute_playtime_summary(self, stats: List[Dict]) -> Dict:
         summary = defaultdict(int)
         for stat in stats:
             for name, minutes in stat.get('playtime_minutes', {}).items():
-                summary[name] += minutes
+                if minutes and minutes > 0:
+                    summary[name] += minutes
         return dict(summary)
     def generate_stats_html(self, summary: Dict, valid_stats: List[Dict], game_summary: Dict, 
                     selected_checks: Dict[str, bool], playtime_summary: Dict) -> str:
@@ -2300,11 +2471,13 @@ class CookieProcessor:
             game_totals = ""
             top_game_headers = ""
             top_game_rows = ""
-            if selected_checks.get('ingame_donate', False) and game_summary:
-                sorted_games = sorted(game_summary.items(), key=lambda x: x[1], reverse=True)
+            non_zero_games = {k: v for k, v in (game_summary or {}).items() if v and v > 0}
+            if selected_checks.get('ingame_donate', False) and non_zero_games:
+                sorted_games = sorted(non_zero_games.items(), key=lambda x: x[1], reverse=True)
                 
                 for game_name, total in sorted_games:
-                    game_headers += f"<th>{game_name}</th>"
+                    safe_gname = _html_lib.escape(str(game_name))
+                    game_headers += f"<th>{safe_gname}</th>"
                     game_totals += f"<td>{total:,}</td>"
                 
                 top_game_headers = "<th>№</th>" + game_headers
@@ -2338,11 +2511,13 @@ class CookieProcessor:
             playtime_totals = ""
             top_playtime_headers = ""
             top_playtime_rows = ""
-            if selected_checks.get('playtime', False) and playtime_summary:
-                sorted_playtime = sorted(playtime_summary.items(), key=lambda x: x[1], reverse=True)
+            non_zero_playtime = {k: v for k, v in (playtime_summary or {}).items() if v and v > 0}
+            if selected_checks.get('playtime', False) and non_zero_playtime:
+                sorted_playtime = sorted(non_zero_playtime.items(), key=lambda x: x[1], reverse=True)
                 
                 for game_name, total in sorted_playtime:
-                    playtime_headers += f"<th>{game_name}</th>"
+                    safe_gname = _html_lib.escape(str(game_name))
+                    playtime_headers += f"<th>{safe_gname}</th>"
                     playtime_totals += f"<td>{total:,}</td>"
                 
                 top_playtime_headers = "<th>№</th>" + playtime_headers
@@ -2834,50 +3009,60 @@ class CookieProcessor:
                             zipf.writestr(f'Gamepasses/{safe_name} ({count}).txt', '\n'.join(self.format_cookie_line(d, selected_badges, selected_gamepasses, selected_checks, selected_ingame, selected_playtime, use_emoji) for d in game_gps))
             
             # InGame Donate
+            _written_ingame_folders = set()
             if selected_checks.get('ingame_donate', False):
                 for short in [k for k in selected_ingame if selected_ingame[k]]:
                     game_info = ingame_games.get(short, GAMES[short])
+                    if not game_info.get('place_id') and not game_info.get('universe_id'):
+                        continue
                     game_name = game_info['name']
                     game_donate_stats = sorted([d for d in valid_stats if d['game_donates'].get(game_name, {'sum': 0})['sum'] > 0],
                                             key=lambda x: x['game_donates'].get(game_name, {'sum': 0})['sum'], reverse=True)
                     if game_donate_stats:
                         safe_folder = self._safe_zip_component(game_name, short).replace(' ', '_')
+                        if safe_folder in _written_ingame_folders:
+                            continue
+                        _written_ingame_folders.add(safe_folder)
                         safe_game_name = self._safe_zip_component(game_name, short)
                         zipf.writestr(f'InGameDonate/{safe_folder}/{safe_game_name} Donate.txt', '\n'.join(self.format_cookie_line(d, selected_badges, selected_gamepasses, selected_checks, selected_ingame, selected_playtime, use_emoji) for d in game_donate_stats))
-                    
-                    ranges = sorted(_LIFETIME_RANGES, key=lambda x: x[0])
-                    thresholds = [t for t, _ in ranges]
-                    for i in range(len(ranges)):
-                        lower = thresholds[i]
-                        upper = thresholds[i+1] if i+1 < len(thresholds) else float('inf')
-                        range_stats = [d for d in game_donate_stats if lower <= d['game_donates'].get(game_name, {'sum': 0})['sum'] < upper]
-                        if range_stats:
-                            name = ranges[i][1]
-                            safe_range_name = self._safe_zip_component(name, "range")
-                            zipf.writestr(f'InGameDonate/{safe_folder}/{safe_range_name}.txt', '\n'.join(self.format_cookie_line(d, selected_badges, selected_gamepasses, selected_checks, selected_ingame, selected_playtime, use_emoji) for d in range_stats))
+                        ranges = sorted(_LIFETIME_RANGES, key=lambda x: x[0])
+                        thresholds = [t for t, _ in ranges]
+                        for i in range(len(ranges)):
+                            lower = thresholds[i]
+                            upper = thresholds[i+1] if i+1 < len(thresholds) else float('inf')
+                            range_stats = [d for d in game_donate_stats if lower <= d['game_donates'].get(game_name, {'sum': 0})['sum'] < upper]
+                            if range_stats:
+                                name = ranges[i][1]
+                                safe_range_name = self._safe_zip_component(name, "range")
+                                zipf.writestr(f'InGameDonate/{safe_folder}/{safe_range_name}.txt', '\n'.join(self.format_cookie_line(d, selected_badges, selected_gamepasses, selected_checks, selected_ingame, selected_playtime, use_emoji) for d in range_stats))
             
             # Playtime
+            _written_playtime_folders = set()
             if selected_checks.get('playtime', False):
                 for short in [k for k in selected_playtime if selected_playtime[k]]:
                     game_info = playtime_games.get(short, GAMES[short])
+                    if not game_info.get('place_id') and not game_info.get('universe_id'):
+                        continue
                     game_name = game_info['name']
                     game_playtime_stats = sorted([d for d in valid_stats if d['playtime_minutes'].get(game_name, 0) > 0],
                                                 key=lambda x: x['playtime_minutes'].get(game_name, 0), reverse=True)
                     if game_playtime_stats:
                         safe_folder = self._safe_zip_component(game_name, short).replace(' ', '_')
+                        if safe_folder in _written_playtime_folders:
+                            continue
+                        _written_playtime_folders.add(safe_folder)
                         safe_game_name = self._safe_zip_component(game_name, short)
                         zipf.writestr(f'Playtime/{safe_folder}/{safe_game_name} Playtime.txt', '\n'.join(self.format_cookie_line(d, selected_badges, selected_gamepasses, selected_checks, selected_ingame, selected_playtime, use_emoji) for d in game_playtime_stats))
-                    
-                    ranges = sorted(_PLAYTIME_RANGES, key=lambda x: x[0])
-                    thresholds = [t for t, _ in ranges]
-                    for i in range(len(ranges)):
-                        lower = thresholds[i]
-                        upper = thresholds[i+1] if i+1 < len(thresholds) else float('inf')
-                        range_stats = [d for d in game_playtime_stats if lower <= d['playtime_minutes'].get(game_name, 0) < upper]
-                        if range_stats:
-                            name = ranges[i][1]
-                            safe_range_name = self._safe_zip_component(name, "range")
-                            zipf.writestr(f'Playtime/{safe_folder}/{safe_range_name}.txt', '\n'.join(self.format_cookie_line(d, selected_badges, selected_gamepasses, selected_checks, selected_ingame, selected_playtime, use_emoji) for d in range_stats))
+                        ranges = sorted(_PLAYTIME_RANGES, key=lambda x: x[0])
+                        thresholds = [t for t, _ in ranges]
+                        for i in range(len(ranges)):
+                            lower = thresholds[i]
+                            upper = thresholds[i+1] if i+1 < len(thresholds) else float('inf')
+                            range_stats = [d for d in game_playtime_stats if lower <= d['playtime_minutes'].get(game_name, 0) < upper]
+                            if range_stats:
+                                name = ranges[i][1]
+                                safe_range_name = self._safe_zip_component(name, "range")
+                                zipf.writestr(f'Playtime/{safe_folder}/{safe_range_name}.txt', '\n'.join(self.format_cookie_line(d, selected_badges, selected_gamepasses, selected_checks, selected_ingame, selected_playtime, use_emoji) for d in range_stats))
             
             # Country
             if selected_checks.get('country', False):
@@ -2944,10 +3129,15 @@ class CookieProcessor:
         if selected_checks.get('rares', False):
             line += f" | Headless: {str(d['headless']).lower()} | Korblox: {str(d['korblox']).lower()}"
 
-        # InGame Donate — теперь по именам игр
+        # InGame Donate — теперь по именам игр (только > 0)
         if selected_checks.get('ingame_donate', False) and d['game_donates']:
-            games_str = " | ".join(f"{name}: {data['sum']} R$" for name, data in d['game_donates'].items())
-            line += f" | InGame: {games_str}"
+            games_str = " | ".join(
+                f"{name}: {data['sum']} R$"
+                for name, data in d['game_donates'].items()
+                if (data.get('sum', 0) if isinstance(data, dict) else data) > 0
+            )
+            if games_str:
+                line += f" | InGame: {games_str}"
 
         # Playtime — теперь по именам игр
         if selected_checks.get('playtime', False) and d['playtime_minutes']:

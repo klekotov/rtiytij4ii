@@ -1243,3 +1243,45 @@ def can_claim_bonus(user_id: int) -> tuple[bool, str]:
             return False, "❌ Ошибка проверки бонуса. Попробуйте позже."
 
     return True, ""
+
+
+# ==================== КЭШ МЕТАДАННЫХ ROBLOX ИГР ====================
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS place_metadata_cache (
+        raw_id INTEGER PRIMARY KEY,
+        name TEXT,
+        place_id INTEGER,
+        universe_id INTEGER
+    )
+""")
+conn.commit()
+
+
+def get_all_cached_places() -> dict[int, dict]:
+    """Возвращает закэшированные названия и universe_id для Roblox игр."""
+    try:
+        cursor.execute("SELECT raw_id, name, place_id, universe_id FROM place_metadata_cache")
+        rows = cursor.fetchall()
+        return {
+            int(r[0]): {"name": r[1], "place_id": r[2], "universe_id": r[3]}
+            for r in rows
+        }
+    except Exception as e:
+        logging.debug(f"get_all_cached_places error: {e}")
+        return {}
+
+
+def save_cached_place(raw_id: int, name: str, place_id: int | None, universe_id: int | None) -> None:
+    """Сохраняет метаданные Roblox игры в кэш SQLite."""
+    try:
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO place_metadata_cache (raw_id, name, place_id, universe_id)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(raw_id), str(name), int(place_id) if place_id else None, int(universe_id) if universe_id else None),
+        )
+        conn.commit()
+    except Exception as e:
+        logging.debug(f"save_cached_place error for {raw_id}: {e}")
+

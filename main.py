@@ -10,7 +10,7 @@ logging.basicConfig(
     force=True,
 )
 
-from handlers import dp, bot, background_giveaway_checker  # Импорт из handlers.py
+from handlers import dp, bot, background_giveaway_checker, cookie_processor  # Импорт из handlers.py
 from utils import start_stats_server, cleanup_old_html_files  # Импорт из utils.py
 
 
@@ -25,9 +25,10 @@ async def main():
         if any(tag in k.upper() for tag in ("PORT", "HOST", "DOMAIN", "WEB", "APP_URL", "PUBLIC_URL"))
         and not any(sec in k.upper() for sec in ("TOKEN", "SECRET", "PASS", "KEY"))
     }
-    logging.info(f"🚀 Запуск бота (build: bothost-fix-v2) | сетевые env: {net_env or 'не заданы'}")
+    logging.info(f"🚀 Запуск бота (build: bothost-fix-v3) | сетевые env: {net_env or 'не заданы'}")
     cleanup_old_html_files()
     await start_stats_server()
+    asyncio.create_task(cookie_processor.resolve_all_games_metadata())
     asyncio.create_task(background_giveaway_checker())  # Запускаем проверку розыгрышей
     await dp.start_polling(bot)
 
