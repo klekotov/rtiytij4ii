@@ -265,91 +265,340 @@ def get_stats_url(filename: str) -> str:
 import os
 import logging
 import traceback
-from typing import List
+import urllib.parse
+from typing import List, Optional, Tuple
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Универсальный парсер прокси
+# Поддерживает:
+#   ip:port
+#   ip:port:login:password
+#   login:password:ip:port
+#   ip:port@login:password              (инвертированный, как в старом файле)
+#   login:password@ip:port               (стандарт)
+#   http://login:password@ip:port
+#   http://ip:port@login:password
+#   socks5://login:password@ip:port
+#   и те же варианты с уже готовым URL (http://user:pass@host:port)
+# Пароль/логин с символами : @ / ? # кодируются через quote
+# ─────────────────────────────────────────────────────────────────────────────
+
+_VALID_SCHEMES = {"http", "https", "socks5", "socks5h", "socks4", "socks4a"}
+
+def _is_valid_port(port_str: str) -> bool:
+    if not port_str or not port_str.isdigit():
+        return False
+    try:
+        p = int(port_str)
+        return 1 <= p <= 65535
+    except ValueError:
+        return False
+
+
+def _is_hostport(s: str) -> bool:
+    """host:port где port — число 1-65535, host не пустой и без @/пробела"""
+    if not s or ":" not in s:
+        return False
+    # IPv6 в скобках: [::1]:8080
+    s = s.strip()
+    if s.startswith("["):
+        end = s.find("]")
+        if end == -1:
+            return False
+        host = s[1:end]
+        rest = s[end + 1:]
+        if not rest.startswith(":"):
+            return False
+        port_str = rest[1:]
+        return bool(host) and _is_valid_port(port_str)
+    # обычный host:port — берём последний ':'
+    if " " in s or "/" in s or "@" in s:
+        return False
+    host, port_str = s.rsplit(":", 1)
+    if not host or not port_str:
+        return False
+    if ":" in host:
+        return False
+    return _is_valid_port(port_str)
+
+
+def _is_creds(s: str) -> bool:
+    """login:password — содержит ':', не является host:port, логин не пустой"""
+    if not s or ":" not in s:
+        return False
+    if _is_hostport(s):
+        return False
+    user, _ = s.split(":", 1)
+    if not user or " " in user or "@" in user:
+        return False
+    return True
+
+
+def _hostport_split(s: str) -> Tuple[str, str]:
+    s = s.strip()
+    if s.startswith("["):
+        end = s.find("]")
+        host = s[1:end]
+        port = s[end + 2:] if s[end + 1] == ":" else s.split(":")[-1]
+        # более надёжно:
+        port = s.rsplit(":", 1)[-1]
+        return host, port
+    host, port = s.rsplit(":", 1)
+    return host.strip(), port.strip()
+
+
+def _build_url(scheme: str, host: str, port: str, user: Optional[str] = None, pwd: Optional[str] = None) -> Optional[str]:
+    host = host.strip()
+    port = port.strip()
+    if not host or not _is_valid_port(port):
+        return None
+    # IPv6 без скобок нужно обернуть
+    host_fmt = host
+    if ":" in host and not host.startswith("["):
+        host_fmt = f"[{host}]"
+    if user is not None:
+        user_q = urllib.parse.quote(user, safe="")
+        pwd_q = urllib.parse.quote(pwd or "", safe="")
+        if pwd is not None and pwd != "":
+            return f"{scheme}://{user_q}:{pwd_q}@{host_fmt}:{port}"
+        elif pwd == "":
+            return f"{scheme}://{user_q}@{host_fmt}:{port}"
+        else:
+            return f"{scheme}://{user_q}:{pwd_q}@{host_fmt}:{port}"
+    else:
+        return f"{scheme}://{host_fmt}:{port}"
+
+
+def _parse_with_at(line: str, scheme: str) -> Optional[str]:
+    """Строка содержит '@' — пробуем все разбиения по '@' (для пароля с '@')."""
+    parts = line.split("@")
+    # перебор по каждому возможному @ как разделителю
+    for i in range(1, len(parts)):
+        left = "@".join(parts[:i])
+        right = "@".join(parts[i:])
+        left = left.strip()
+        right = right.strip()
+        if not left or not right:
+            continue
+        # случай 1: left = host:port , right = user:pass
+        if _is_hostport(left) and _is_creds(right):
+            host, port = _hostport_split(left)
+            user, pwd = right.split(":", 1)
+            url = _build_url(scheme, host, port, user, pwd)
+            if url:
+                return url
+        # случай 2: left = user:pass , right = host:port (стандарт)
+        if _is_creds(left) and _is_hostport(right):
+            user, pwd = left.split(":", 1)
+            host, port = _hostport_split(right)
+            url = _build_url(scheme, host, port, user, pwd)
+            if url:
+                return url
+    return None
+
+
+def _parse_without_at(line: str, scheme: str) -> Optional[str]:
+    """Строка без '@' — host:port или с credentials через ':'"""
+    line = line.strip()
+    if not line:
+        return None
+    # простой host:port
+    if _is_hostport(line) and line.count(":") == 1:
+        # для IPv6 будет больше, но считаем hostport
+        host, port = _hostport_split(line)
+        return _build_url(scheme, host, port, None, None)
+    # частый случай: одно ':' но это не hostport? тогда не прокси
+    parts = line.split(":")
+    if len(parts) == 2:
+        # host:port — уже проверено выше, но если port не валиден — отклоним
+        if _is_hostport(line):
+            host, port = _hostport_split(line)
+            return _build_url(scheme, host, port, None, None)
+        return None
+    if len(parts) >= 4:
+        # вариант A: host:port:user:pass  (порт на 2-й позиции)
+        host_a = parts[0].strip()
+        port_a = parts[1].strip()
+        if host_a and _is_valid_port(port_a):
+            user_a = parts[2].strip()
+            pwd_a = ":".join(parts[3:])  # пароль может содержать ':'
+            if user_a:
+                url = _build_url(scheme, host_a, port_a, user_a, pwd_a)
+                if url:
+                    return url
+        # вариант B: user:pass:host:port  (порт в конце)
+        host_b = parts[-2].strip()
+        port_b = parts[-1].strip()
+        if host_b and _is_valid_port(port_b):
+            # user — первый элемент, pass — всё между 1 и -2
+            if len(parts) == 4:
+                user_b = parts[0].strip()
+                pwd_b = parts[1].strip()
+                if user_b:
+                    url = _build_url(scheme, host_b, port_b, user_b, pwd_b)
+                    if url:
+                        return url
+            elif len(parts) > 4:
+                user_b = parts[0].strip()
+                pwd_b = ":".join(parts[1:-2])
+                if user_b:
+                    url = _build_url(scheme, host_b, port_b, user_b, pwd_b)
+                    if url:
+                        return url
+    # 3 части — неоднозначно, пробуем оба как выше с пустым паролем? пропускаем
+    return None
+
+
+def _parse_fallback_at_in_password(line: str, scheme: str) -> Optional[str]:
+    """
+    Фолбек для случаев когда пароль содержит '@' но формат без '@' (ip:port:user:pass).
+    Пример: 192.168.1.1:8080:user:pa$$w@rd  → host:port в начале, pass с @.
+            user:pa@ss:1.1.1.1:8080         → host:port в конце, pass с @.
+    """
+    # Попытка 1: host:port в начале → "host:port:user:pass_with_@"
+    # Разбиваем максимум на 3 части: host, port, остаток (user:pass)
+    try:
+        parts = line.split(":", 2)
+        if len(parts) == 3:
+            host_cand = parts[0].strip()
+            port_cand = parts[1].strip()
+            rest = parts[2]
+            cand_hp = f"{host_cand}:{port_cand}"
+            if host_cand and _is_valid_port(port_cand) and _is_hostport(cand_hp) and ":" in rest:
+                user, pwd = rest.split(":", 1)
+                if user:
+                    url = _build_url(scheme, host_cand, port_cand, user, pwd)
+                    if url:
+                        return url
+    except Exception:
+        pass
+    # Попытка 2: host:port в конце → "user:pass_with_@:host:port"
+    # Ищем трейлинговый host:port через regex
+    try:
+        m = re.search(r'([\w\.\-]+|\[[^\]]+\]):(\d+)\s*$', line)
+        if m:
+            hostport = m.group(0).strip()
+            if _is_hostport(hostport):
+                # префикс до hostport (без последнего ':host:port')
+                prefix = line[: len(line) - len(hostport)].rstrip(":")
+                if ":" in prefix:
+                    user, pwd = prefix.split(":", 1)
+                    if user:
+                        host, port = _hostport_split(hostport)
+                        url = _build_url(scheme, host, port, user, pwd)
+                        if url:
+                            return url
+    except Exception:
+        pass
+    return None
+
+
+def parse_proxy_line(raw_line: str) -> Optional[str]:
+    """
+    Парсит одну строку прокси в нормализованный URL.
+    Возвращает None если строка пустая/комментарий/невалидна.
+    """
+    if not isinstance(raw_line, str):
+        return None
+    orig = raw_line.strip()
+    if not orig or orig.startswith("#") or orig.startswith("//"):
+        return None
+
+    scheme = "http"
+    line = orig
+    if "://" in line:
+        scheme_part, rest = line.split("://", 1)
+        scheme_low = scheme_part.lower().strip()
+        if scheme_low in _VALID_SCHEMES:
+            scheme = scheme_low
+            line = rest
+        elif re.match(r"^[a-z0-9]+$", scheme_low):
+            # неизвестная но похожая на схему — считаем http
+            scheme = "http"
+            line = rest
+        # иначе оставляем как есть (напр. "user:pass://host" — маловероятно)
+        line = line.strip().lstrip("/")
+
+    line = line.strip().rstrip("/")
+    # убираем пробелы внутри (прокси не содержат пробелов)
+    line = re.sub(r"\s+", "", line)
+    if not line:
+        return None
+
+    if "@" in line:
+        res = _parse_with_at(line, scheme)
+        if res:
+            return res
+        # фолбек: пароль содержит '@' но формат ip:port:user:pass
+        fb = _parse_fallback_at_in_password(line, scheme)
+        if fb:
+            return fb
+        return None
+    else:
+        return _parse_without_at(line, scheme)
+
+
+def _mask_proxy(proxy_url: str) -> str:
+    """Маскирует пароль для логов: http://user:***@host:port"""
+    try:
+        if "@" not in proxy_url:
+            return proxy_url
+        # scheme://creds@host
+        scheme, rest = proxy_url.split("://", 1)
+        creds, hostport = rest.rsplit("@", 1)
+        if ":" in creds:
+            user, _ = creds.split(":", 1)
+            return f"{scheme}://{user}:***@{hostport}"
+        else:
+            return f"{scheme}://***@{hostport}"
+    except Exception:
+        return proxy_url[:30] + "***"
+
 
 def load_proxies(file_path: str) -> List[str]:
     """
-    Загружает прокси из файла.
-    Поддерживаемые форматы строк:
-    1. ip:http_port:login:password
-       Пример: 192.168.1.1:8080:user123:pass456
-    
-    2. ip:port@login:password  
-       Пример: 196.19.10.63:8000@jYVpxc:CeANUv
-    
-    3. ip:port@login:password с дополнительными параметрами
-       Пример: 196.19.11.136:8000@hpCMTz:5yGTpp
+    Загружает прокси из файла и нормализует каждый в URL вида
+    http://login:pass@host:port (логин/пароль URL-encoded).
+
+    Поддерживаемые входные форматы:
+      ip:port
+      ip:port:login:password
+      login:password:ip:port
+      ip:port@login:password
+      login:password@ip:port
+      http://login:password@ip:port
+      http://ip:port@login:password
+      socks5://login:password@ip:port
+    Также:
+      - пароль/логин могут содержать : @ и другие спецсимволы (кодируются)
+      - строки с пробелами, пустые, комментарии # пропускаются
+      - дубликаты удаляются (сохраняется порядок)
     """
-    proxies = []
+    proxies: List[str] = []
+    seen = set()
     try:
         if not os.path.exists(file_path):
             logging.error(f"Файл прокси не найден: {file_path}")
             return []
 
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line_num, line in enumerate(f, 1):
-                line = line.strip()
-                if not line or line.startswith('#'):
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line_num, raw in enumerate(f, 1):
+                # убираем BOM и пробелы
+                line = raw.strip().lstrip("\ufeff")
+                if not line or line.startswith("#") or line.startswith("//"):
                     continue
 
-                # Определяем формат строки и парсим
-                proxy_url = None
-                
-                # Формат 1: ip:port:login:password (через двоеточия)
-                if line.count(':') == 3 and '@' not in line:
-                    parts = line.split(':')
-                    ip, port, username, password = parts
-                    
-                    # Проверка порта на валидность
-                    try:
-                        port_num = int(port)
-                        if not (1 <= port_num <= 65535):
-                            raise ValueError
-                    except ValueError:
-                        logging.warning(f"Прокси строка {line_num}: неверный порт '{port}' — пропущено: {line}")
-                        continue
-                    
-                    proxy_url = f"http://{username}:{password}@{ip}:{port}"
-                
-                # Формат 2 и 3: ip:port@login:password (с возможными дополнительными символами после пароля)
-                elif '@' in line:
-                    # Разделяем на адрес и часть с авторизацией
-                    address_part, auth_part = line.split('@', 1)
-                    
-                    # Проверяем, что в auth_part есть двоеточие
-                    if ':' not in auth_part:
-                        logging.warning(f"Прокси строка {line_num}: неверный формат авторизации — пропущено: {line}")
-                        continue
-                    
-                    # Разделяем логин и пароль (берем только первые две части, остальное игнорируем)
-                    auth_parts = auth_part.split(':', 1)
-                    username, password = auth_parts[0], auth_parts[1]
-                    
-                    # Проверяем, что в address_part есть двоеточие (ip:port)
-                    if ':' not in address_part:
-                        logging.warning(f"Прокси строка {line_num}: неверный формат адреса — пропущено: {line}")
-                        continue
-                    
-                    ip, port = address_part.split(':', 1)
-                    
-                    # Проверка порта на валидность
-                    try:
-                        port_num = int(port)
-                        if not (1 <= port_num <= 65535):
-                            raise ValueError
-                    except ValueError:
-                        logging.warning(f"Прокси строка {line_num}: неверный порт '{port}' — пропущено: {line}")
-                        continue
-                    
-                    proxy_url = f"http://{username}:{password}@{ip}:{port}"
-                
-                else:
-                    logging.warning(f"Прокси строка {line_num}: неподдерживаемый формат — пропущено: {line}")
+                proxy_url = parse_proxy_line(line)
+                if not proxy_url:
+                    logging.warning(f"Прокси строка {line_num}: неподдерживаемый формат — пропущено: {raw.strip()[:80]}")
                     continue
 
-                if proxy_url:
+                if proxy_url not in seen:
+                    seen.add(proxy_url)
                     proxies.append(proxy_url)
-                    logging.debug(f"Загружен прокси: {proxy_url}")
+                    logging.debug(f"Загружен прокси: {_mask_proxy(proxy_url)}")
+                else:
+                    logging.debug(f"Прокси строка {line_num}: дубликат — пропущено: {_mask_proxy(proxy_url)}")
 
         logging.info(f"Успешно загружено {len(proxies)} прокси из {file_path}")
         return proxies
