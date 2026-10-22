@@ -1463,126 +1463,559 @@ class CookieProcessor:
         
         return None
 
+    @staticmethod
+    def _parse_input_game_ids(game_ids_input) -> List[int]:
+        """Извлекает уникальные числовые ID игр (из строки через запятую/перенос, URL /games/<id> или списка)."""
+        if isinstance(game_ids_input, (list, tuple, set)):
+            raw_text = ", ".join(str(x) for x in game_ids_input)
+        else:
+            raw_text = str(game_ids_input or "")
+
+        found: List[int] = []
+        seen: Set[int] = set()
+        for token in re.split(r"[,\s;]+", raw_text.strip()):
+            token = token.strip()
+            if not token:
+                continue
+            m = re.search(r"/games/(\d+)", token)
+            num_str = m.group(1) if m else (token if token.isdigit() else None)
+            if num_str:
+                val = int(num_str)
+                if val > 0 and val not in seen:
+                    seen.add(val)
+                    found.append(val)
+        return found
+
+    def _pick_api_proxy(self, attempt: int) -> Optional[str]:
+        """Выбирает прокси из пула для публичных API Roblox (чередует прокси и прямое соединение)."""
+        if attempt == 0:
+            px = self._next_fresher_proxy(None)
+            return px
+        if attempt % 2 == 1:
+            return self._next_fresher_proxy(None)
+        return None
+
+    async def resolve_raw_game_ids(self, raw_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        """
+        Универсальный пакетный резолвер любых ID игр (и place_id, и universe_id) ->
+        {raw_id: {"name": str, "place_id": int, "universe_id": int}}.
+        Использует SQLite-кэш, ротацию прокси и зеркало roproxy при 429.
+        """
+        cached = get_all_cached_places()
+        resolved: Dict[int, Dict[str, Any]] = {}
+
+        # Также учитываем уже известные встроенные игры из config.GAMES
+        builtin_by_id: Dict[int, Dict[str, Any]] = {}
+        for info in GAMES.values():
+            if info.get("universe_id") and info.get("place_id") and not str(info.get("name", "")).startswith("Game "):
+                builtin_by_id[int(info["place_id"])] = {
+                    "name": info["name"],
+                    "place_id": int(info["place_id"]),
+                    "universe_id": int(info["universe_id"]),
+                }
+                builtin_by_id[int(info["universe_id"])] = {
+                    "name": info["name"],
+                    "place_id": int(info["place_id"]),
+                    "universe_id": int(info["universe_id"]),
+                }
+
+        remaining: List[int] = []
+        for rid in raw_ids:
+            rid = int(rid)
+            if rid in cached and cached[rid].get("universe_id") and cached[rid].get("name") and not str(cached[rid]["name"]).startswith("Game "):
+                resolved[rid] = cached[rid]
+            elif rid in builtin_by_id:
+                resolved[rid] = builtin_by_id[rid]
+            else:
+                remaining.append(rid)
+
+        if not remaining:
+            return resolved
+
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": random.choice(USER_AGENTS),
+        }
+        sem = asyncio.Semaphore(10)
+        place_to_uid: Dict[int, int] = {}
+
+        connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=25)
+        timeout = aiohttp.ClientTimeout(total=8)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
+            # Шаг 1: разрешаем place_id -> universe_id через ротацию прокси + roproxy fallback
+            async def _resolve_one_place(pid: int):
+                async with sem:
+                    hosts = [
+                        f"https://apis.roblox.com/universes/v1/places/{pid}/universe",
+                        f"https://apis.roproxy.com/universes/v1/places/{pid}/universe",
+                    ]
+                    for attempt in range(5):
+                        url = hosts[0] if attempt < 3 else hosts[attempt % len(hosts)]
+                        px = self._pick_api_proxy(attempt)
+                        px_kwargs = get_proxy_aiohttp_params(px) if px else {}
+                        px_kwargs.pop("_is_socks", None)
+                        try:
+                            async with session.get(url, **px_kwargs) as r:
+                                if r.status == 200:
+                                    data = await r.json()
+                                    uid = data.get("universeId")
+                                    if uid:
+                                        place_to_uid[pid] = int(uid)
+                                    return
+                                if r.status in (400, 404):
+                                    # Значит pid не placeId (возможно уже universeId) — обработаем на шаге 2
+                                    return
+                                if r.status == 429:
+                                    await asyncio.sleep(0.5 * (attempt + 1))
+                        except Exception:
+                            await asyncio.sleep(0.25 * (attempt + 1))
+
+            await asyncio.gather(*(_resolve_one_place(pid) for pid in remaining))
+
+            # Все кандидаты в universeId: и найденные из placeId, и те raw_id, которые могли сами быть universeId
+            unmatched_raw = [rid for rid in remaining if rid not in place_to_uid]
+            all_universe_ids = list(dict.fromkeys(list(place_to_uid.values()) + unmatched_raw))
+
+            uid_to_meta: Dict[int, Dict[str, Any]] = {}
+            for i in range(0, len(all_universe_ids), 50):
+                batch = all_universe_ids[i:i + 50]
+                joined = ",".join(str(u) for u in batch)
+                game_urls = [
+                    f"https://games.roblox.com/v1/games?universeIds={joined}",
+                    f"https://games.roproxy.com/v1/games?universeIds={joined}",
+                ]
+                for attempt in range(5):
+                    gurl = game_urls[0] if attempt < 3 else game_urls[attempt % len(game_urls)]
+                    px = self._pick_api_proxy(attempt)
+                    px_kwargs = get_proxy_aiohttp_params(px) if px else {}
+                    px_kwargs.pop("_is_socks", None)
+                    try:
+                        async with session.get(gurl, **px_kwargs) as gr:
+                            if gr.status == 200:
+                                gdata = await gr.json()
+                                for item in gdata.get("data", []):
+                                    if item.get("id"):
+                                        uid_to_meta[int(item["id"])] = item
+                                break
+                            if gr.status == 429:
+                                await asyncio.sleep(0.6 * (attempt + 1))
+                    except Exception:
+                        await asyncio.sleep(0.3 * (attempt + 1))
+
+            for pid, uid in place_to_uid.items():
+                meta = uid_to_meta.get(uid, {})
+                gname = (meta.get("name") or f"Game {pid}").strip()
+                root_pid = int(meta.get("rootPlaceId") or pid)
+                entry = {
+                    "name": gname,
+                    "place_id": pid,
+                    "root_place_id": root_pid,
+                    "universe_id": uid,
+                }
+                resolved[pid] = entry
+                save_cached_place(pid, gname, pid, uid)
+
+            for raw_uid in unmatched_raw:
+                meta = uid_to_meta.get(raw_uid)
+                if meta:
+                    gname = (meta.get("name") or f"Game {raw_uid}").strip()
+                    root_pid = int(meta.get("rootPlaceId") or raw_uid)
+                    entry = {
+                        "name": gname,
+                        "place_id": root_pid,
+                        "root_place_id": root_pid,
+                        "universe_id": int(raw_uid),
+                    }
+                    resolved[raw_uid] = entry
+                    save_cached_place(raw_uid, gname, root_pid, int(raw_uid))
+
+        return resolved
+
     async def resolve_all_games_metadata(self) -> int:
         """
         Подгружает из SQLite-кэша и (для ещё не закэшированных ID) из Roblox API
         точные названия игр и universe_id для всех слотов в config.GAMES.
-        Поддерживает как place_id, так и universe_id.
         """
-        cached = get_all_cached_places()
-        unresolved: List[Tuple[str, int]] = []
-        applied_from_cache = 0
+        if not hasattr(self, "_games_resolve_lock"):
+            self._games_resolve_lock = asyncio.Lock()
 
-        for short, info in GAMES.items():
-            raw_id = info.get('raw_id') or info.get('place_id')
-            if not raw_id:
+        async with self._games_resolve_lock:
+            raw_to_shorts: Dict[int, List[str]] = defaultdict(list)
+            for short, info in GAMES.items():
+                raw_id = info.get("raw_id") or info.get("place_id")
+                if raw_id:
+                    raw_to_shorts[int(raw_id)].append(short)
+
+            if not raw_to_shorts:
+                return 0
+
+            try:
+                resolved = await self.resolve_raw_game_ids(list(raw_to_shorts.keys()))
+                updated = 0
+                for raw_id, shorts in raw_to_shorts.items():
+                    meta = resolved.get(raw_id)
+                    if not meta:
+                        continue
+                    for short in shorts:
+                        if meta.get("name"):
+                            GAMES[short]["name"] = meta["name"]
+                        if meta.get("place_id"):
+                            GAMES[short]["place_id"] = meta["place_id"]
+                        if meta.get("root_place_id"):
+                            GAMES[short]["root_place_id"] = meta["root_place_id"]
+                        if meta.get("universe_id"):
+                            GAMES[short]["universe_id"] = meta["universe_id"]
+                            UNIVERSE_IDS[short] = meta["universe_id"]
+                        updated += 1
+                logging.info(f"🎮 Метаданные игр актуальны: {updated}/{len(raw_to_shorts)} слотов с названиями и universe_id")
+                return updated
+            except Exception as e:
+                logging.warning(f"⚠️ Ошибка при обновлении названий игр: {e}")
+                return 0
+
+    @staticmethod
+    def _collect_checked_gamepasses_context(user_id: Optional[int] = None) -> Tuple[Set[int], Set[int]]:
+        """
+        Возвращает (множество уже проверяемых ID геймпассов, множество universe_id игр из GAMEPASSES_PER_GAME).
+        """
+        checked_ids: Set[int] = set()
+        for gp_list in GAMEPASSES_PER_GAME.values():
+            checked_ids.update(int(x) for x in gp_list)
+        if user_id is not None:
+            try:
+                custom_gps = get_user_custom_configs(user_id, "gamepasses") or {}
+                for gp_list in custom_gps.values():
+                    checked_ids.update(int(x) for x in gp_list)
+            except Exception:
+                pass
+
+        # Universe ID встроенных игр, которые уже проверяются в GAMEPASSES_PER_GAME
+        builtin_gp_universes: Set[int] = {
+            7709344486,  # Steal a Brainrot
+            3317771874,  # Pet Simulator 99
+            66654135,    # MM2
+            245662005,   # Jailbreak
+            994732206,   # Blox Fruits
+            4777817887,  # Blade Ball
+            601130232,   # Bee Swarm
+            383310974,   # Adopt Me
+        }
+        return checked_ids, builtin_gp_universes
+
+    @staticmethod
+    def _collect_checked_badges_context(user_id: Optional[int] = None) -> Tuple[Set[int], Set[int]]:
+        """
+        Возвращает (множество уже проверяемых ID бейджей, множество universe_id игр из BADGES_PER_GAME).
+        """
+        checked_ids: Set[int] = set()
+        for b_list in BADGES_PER_GAME.values():
+            checked_ids.update(int(x) for x in b_list)
+        if user_id is not None:
+            try:
+                custom_bs = get_user_custom_configs(user_id, "badges") or {}
+                for b_list in custom_bs.values():
+                    checked_ids.update(int(x) for x in b_list)
+            except Exception:
+                pass
+
+        # Universe ID встроенных игр, которые уже проверяются в BADGES_PER_GAME
+        builtin_badge_universes: Set[int] = {
+            3317771874,  # Pet Simulator 99
+            66654135,    # MM2
+            245662005,   # Jailbreak
+            7436755782,  # Grow a Garden
+            994732206,   # Blox Fruits
+            601130232,   # Bee Swarm
+            383310974,   # Adopt Me
+        }
+        return checked_ids, builtin_badge_universes
+
+    async def fetch_paid_gamepasses_for_games(
+        self,
+        game_ids_input,
+        user_id: Optional[int] = None,
+        progress_cb=None,
+    ) -> Dict[str, Any]:
+        """
+        Принимает ID игр (через запятую / список), находит ВСЕ ПЛАТНЫЕ (price > 0) геймпассы каждой игры.
+        Если игра уже проверяется в GAMEPASSES_PER_GAME / кастомных геймпассах (по universe_id или пересечению ID) —
+        пропускает эту игру целиком.
+        Возвращает словарь с полем 'csv' ("id1, id2, ...") и подробной статистикой.
+        """
+        raw_ids = self._parse_input_game_ids(game_ids_input)
+        if not raw_ids:
+            return {"csv": "", "ids": [], "skipped_games": [], "processed_games": [], "unresolved_ids": []}
+
+        resolved_map = await self.resolve_raw_game_ids(raw_ids)
+        checked_gp_ids, checked_gp_universes = self._collect_checked_gamepasses_context(user_id)
+
+        unique_universes: List[Tuple[int, int, str]] = []
+        seen_uids: Set[int] = set()
+        unresolved_ids: List[int] = []
+        skipped_games: List[str] = []
+
+        for rid in raw_ids:
+            meta = resolved_map.get(rid)
+            if not meta or not meta.get("universe_id"):
+                unresolved_ids.append(rid)
                 continue
-            if raw_id in cached:
-                c = cached[raw_id]
-                if c.get('name'):
-                    info['name'] = c['name']
-                if c.get('place_id'):
-                    info['place_id'] = c['place_id']
-                if c.get('universe_id'):
-                    info['universe_id'] = c['universe_id']
-                    UNIVERSE_IDS[short] = c['universe_id']
-                applied_from_cache += 1
-            elif not info.get('universe_id') or str(info.get('name', '')).startswith('Game '):
-                unresolved.append((short, int(raw_id)))
+            uid = int(meta["universe_id"])
+            gname = meta.get("name") or f"Game {rid}"
+            if uid in seen_uids:
+                continue
+            seen_uids.add(uid)
+            if uid in checked_gp_universes:
+                skipped_games.append(f"{gname} ({rid})")
+                continue
+            unique_universes.append((rid, uid, gname))
 
-        if applied_from_cache:
-            logging.info(f"🎮 Загружено из кэша БД: {applied_from_cache} игр")
-        if not unresolved:
-            return applied_from_cache
+        per_game_results: Dict[int, Tuple[str, List[int], bool]] = {}
+        sem = asyncio.Semaphore(10)
+        done_count = 0
+        total_u = len(unique_universes)
 
-        logging.info(f"🔄 Авто-резолв названий и universe_id для {len(unresolved)} Roblox игр...")
-        sem = asyncio.Semaphore(12)
-        resolved_universe_by_short: Dict[str, Tuple[int, int]] = {}
-        fallback_universe_candidates: List[Tuple[str, int]] = []
+        headers = {"Accept": "application/json", "User-Agent": random.choice(USER_AGENTS)}
+        connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=25)
+        timeout = aiohttp.ClientTimeout(total=10)
 
-        try:
-            connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=20)
-            timeout = aiohttp.ClientTimeout(total=5)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async def _fetch_universe(short_code: str, pid: int):
-                    async with sem:
-                        for attempt in range(2):
-                            px = self._next_fresher_proxy(None) if attempt == 1 else None
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
+            async def _fetch_gp_universe(rid: int, uid: int, gname: str):
+                nonlocal done_count
+                all_ids_in_game: List[int] = []
+                paid_ids_in_game: List[int] = []
+                seen_tokens: Set[str] = set()
+                page_token = ""
+
+                async with sem:
+                    while True:
+                        token_param = f"&pageToken={page_token}" if page_token else ""
+                        urls = [
+                            f"https://apis.roblox.com/game-passes/v1/universes/{uid}/game-passes?passView=Full&pageSize=100{token_param}",
+                            f"https://apis.roproxy.com/game-passes/v1/universes/{uid}/game-passes?passView=Full&pageSize=100{token_param}",
+                        ]
+                        data = None
+                        for attempt in range(5):
+                            u = urls[0] if attempt < 3 else urls[attempt % len(urls)]
+                            px = self._pick_api_proxy(attempt)
                             px_kwargs = get_proxy_aiohttp_params(px) if px else {}
+                            px_kwargs.pop("_is_socks", None)
                             try:
-                                async with session.get(
-                                    f"https://apis.roblox.com/universes/v1/places/{pid}/universe",
-                                    headers={"Accept": "application/json"},
-                                    **px_kwargs,
-                                ) as r:
-                                    if r.status == 200:
-                                        data = await r.json()
-                                        uid = data.get("universeId")
-                                        if uid:
-                                            resolved_universe_by_short[short_code] = (pid, int(uid))
-                                            return
-                                        fallback_universe_candidates.append((short_code, pid))
-                                        return
+                                async with session.get(u, **px_kwargs) as resp:
+                                    if resp.status == 200:
+                                        data = await resp.json()
+                                        break
+                                    if resp.status == 429:
+                                        await asyncio.sleep(0.6 * (attempt + 1))
+                                    elif resp.status in (400, 404):
+                                        break
                             except Exception:
+                                await asyncio.sleep(0.3 * (attempt + 1))
+
+                        if not data:
+                            break
+
+                        items = data.get("gamePasses")
+                        if items is None:
+                            items = data.get("data", [])
+
+                        for gp in items or []:
+                            gp_id = gp.get("id")
+                            if not gp_id:
                                 continue
+                            gp_id = int(gp_id)
+                            all_ids_in_game.append(gp_id)
 
-                await asyncio.gather(*(_fetch_universe(s, pid) for s, pid in unresolved))
+                            raw_price = gp.get("price")
+                            if raw_price is None and isinstance(gp.get("priceInformation"), dict):
+                                raw_price = gp["priceInformation"].get("defaultPriceInRobux")
+                            if raw_price is None:
+                                raw_price = gp.get("priceInRobux") if gp.get("priceInRobux") is not None else gp.get("PriceInRobux")
+                            is_for_sale = gp.get("isForSale")
+                            try:
+                                is_paid = (raw_price is not None and int(raw_price) > 0) and (is_for_sale is not False)
+                            except (TypeError, ValueError):
+                                is_paid = False
 
-                # Пакетно запрашиваем названия всех найденных universeId (до 50 за 1 запрос)
-                uid_to_meta: Dict[int, Dict[str, Any]] = {}
-                all_uids = list({uid for _, uid in resolved_universe_by_short.values()} | {pid for _, pid in fallback_universe_candidates})
-                for i in range(0, len(all_uids), 50):
-                    batch = all_uids[i:i + 50]
-                    joined = ",".join(str(u) for u in batch)
-                    for attempt in range(2):
-                        px = self._next_fresher_proxy(None) if attempt == 1 else None
-                        px_kwargs = get_proxy_aiohttp_params(px) if px else {}
-                        try:
-                            async with session.get(
-                                f"https://games.roblox.com/v1/games?universeIds={joined}",
-                                headers={"Accept": "application/json"},
-                                **px_kwargs,
-                            ) as gr:
-                                if gr.status == 200:
-                                    gdata = await gr.json()
-                                    for item in gdata.get("data", []):
-                                        if item.get("id"):
-                                            uid_to_meta[int(item["id"])] = item
-                                    break
-                        except Exception:
-                            continue
+                            if is_paid:
+                                paid_ids_in_game.append(gp_id)
 
-                newly_resolved = 0
-                for short_code, (orig_pid, uid) in resolved_universe_by_short.items():
-                    meta = uid_to_meta.get(uid, {})
-                    gname = (meta.get("name") or GAMES[short_code]["name"]).strip()
-                    root_pid = meta.get("rootPlaceId")
-                    GAMES[short_code]["name"] = gname
-                    GAMES[short_code]["universe_id"] = uid
-                    if root_pid:
-                        GAMES[short_code]["root_place_id"] = int(root_pid)
-                    UNIVERSE_IDS[short_code] = uid
-                    save_cached_place(orig_pid, gname, orig_pid, uid)
-                    newly_resolved += 1
+                        next_token = data.get("nextPageToken") or data.get("nextPageCursor") or ""
+                        if not next_token or next_token in seen_tokens:
+                            break
+                        seen_tokens.add(next_token)
+                        page_token = next_token
 
-                for short_code, raw_uid in fallback_universe_candidates:
-                    meta = uid_to_meta.get(raw_uid)
-                    if meta:
-                        gname = (meta.get("name") or GAMES[short_code]["name"]).strip()
-                        root_pid = int(meta.get("rootPlaceId") or raw_uid)
-                        GAMES[short_code]["name"] = gname
-                        GAMES[short_code]["place_id"] = root_pid
-                        GAMES[short_code]["root_place_id"] = root_pid
-                        GAMES[short_code]["universe_id"] = raw_uid
-                        UNIVERSE_IDS[short_code] = raw_uid
-                        save_cached_place(raw_uid, gname, root_pid, raw_uid)
-                        newly_resolved += 1
+                already_checked_overlap = any(gid in checked_gp_ids for gid in all_ids_in_game)
+                per_game_results[uid] = (f"{gname} ({rid})", paid_ids_in_game, already_checked_overlap)
+                done_count += 1
+                if progress_cb:
+                    try:
+                        await progress_cb(done_count, total_u)
+                    except Exception:
+                        pass
 
-                logging.info(f"✅ Авто-резолв игр завершён: {newly_resolved}/{len(unresolved)} обновлено и сохранено в БД")
-                return applied_from_cache + newly_resolved
-        except Exception as e:
-            logging.warning(f"⚠️ Авто-резолв метаданных игр завершился частично: {e}")
-            return applied_from_cache
+            await asyncio.gather(*(_fetch_gp_universe(r, u, g) for r, u, g in unique_universes))
+
+        final_ids: List[int] = []
+        seen_final: Set[int] = set()
+        processed_games: List[str] = []
+        for rid, uid, gname in unique_universes:
+            label, paid_list, has_overlap = per_game_results.get(uid, (f"{gname} ({rid})", [], False))
+            if has_overlap:
+                skipped_games.append(label)
+                continue
+            processed_games.append(label)
+            for gp_id in paid_list:
+                if gp_id not in seen_final and gp_id not in checked_gp_ids:
+                    seen_final.add(gp_id)
+                    final_ids.append(gp_id)
+
+        csv_out = ", ".join(str(x) for x in final_ids)
+        return {
+            "csv": csv_out,
+            "ids": final_ids,
+            "skipped_games": skipped_games,
+            "processed_games": processed_games,
+            "unresolved_ids": unresolved_ids,
+        }
+
+    async def fetch_all_badges_for_games(
+        self,
+        game_ids_input,
+        user_id: Optional[int] = None,
+        progress_cb=None,
+    ) -> Dict[str, Any]:
+        """
+        Принимает ID игр (через запятую / список), находит АБСОЛЮТНО ВСЕ бейджи каждой игры.
+        Если игра уже проверяется в BADGES_PER_GAME / кастомных бейджах (по universe_id или пересечению ID) —
+        пропускает эту игру целиком.
+        Возвращает словарь с полем 'csv' ("id1, id2, ...") и подробной статистикой.
+        """
+        raw_ids = self._parse_input_game_ids(game_ids_input)
+        if not raw_ids:
+            return {"csv": "", "ids": [], "skipped_games": [], "processed_games": [], "unresolved_ids": []}
+
+        resolved_map = await self.resolve_raw_game_ids(raw_ids)
+        checked_badge_ids, checked_badge_universes = self._collect_checked_badges_context(user_id)
+
+        unique_universes: List[Tuple[int, int, str]] = []
+        seen_uids: Set[int] = set()
+        unresolved_ids: List[int] = []
+        skipped_games: List[str] = []
+
+        for rid in raw_ids:
+            meta = resolved_map.get(rid)
+            if not meta or not meta.get("universe_id"):
+                unresolved_ids.append(rid)
+                continue
+            uid = int(meta["universe_id"])
+            gname = meta.get("name") or f"Game {rid}"
+            if uid in seen_uids:
+                continue
+            seen_uids.add(uid)
+            if uid in checked_badge_universes:
+                skipped_games.append(f"{gname} ({rid})")
+                continue
+            unique_universes.append((rid, uid, gname))
+
+        per_game_results: Dict[int, Tuple[str, List[int], bool]] = {}
+        sem = asyncio.Semaphore(10)
+        done_count = 0
+        total_u = len(unique_universes)
+
+        headers = {"Accept": "application/json", "User-Agent": random.choice(USER_AGENTS)}
+        connector = aiohttp.TCPConnector(ssl=_SSL_CTX, limit=25)
+        timeout = aiohttp.ClientTimeout(total=10)
+
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers) as session:
+            async def _fetch_badges_universe(rid: int, uid: int, gname: str):
+                nonlocal done_count
+                badge_ids_in_game: List[int] = []
+                seen_cursors: Set[str] = set()
+                cursor_val = ""
+
+                async with sem:
+                    while True:
+                        cursor_q = f"&cursor={cursor_val}" if cursor_val else ""
+                        urls = [
+                            f"https://badges.roblox.com/v1/universes/{uid}/badges?limit=100&sortOrder=Asc{cursor_q}",
+                            f"https://badges.roproxy.com/v1/universes/{uid}/badges?limit=100&sortOrder=Asc{cursor_q}",
+                        ]
+                        data = None
+                        for attempt in range(5):
+                            u = urls[0] if attempt < 3 else urls[attempt % len(urls)]
+                            px = self._pick_api_proxy(attempt)
+                            px_kwargs = get_proxy_aiohttp_params(px) if px else {}
+                            px_kwargs.pop("_is_socks", None)
+                            try:
+                                async with session.get(u, **px_kwargs) as resp:
+                                    if resp.status == 200:
+                                        data = await resp.json()
+                                        break
+                                    if resp.status == 429:
+                                        await asyncio.sleep(0.6 * (attempt + 1))
+                                    elif resp.status in (400, 404):
+                                        break
+                            except Exception:
+                                await asyncio.sleep(0.3 * (attempt + 1))
+
+                        if not data:
+                            break
+
+                        for b in data.get("data", []) or []:
+                            bid = b.get("id")
+                            if bid:
+                                badge_ids_in_game.append(int(bid))
+
+                        next_cursor = data.get("nextPageCursor") or ""
+                        if not next_cursor or next_cursor in seen_cursors:
+                            break
+                        seen_cursors.add(next_cursor)
+                        cursor_val = next_cursor
+
+                already_checked_overlap = any(bid in checked_badge_ids for bid in badge_ids_in_game)
+                per_game_results[uid] = (f"{gname} ({rid})", badge_ids_in_game, already_checked_overlap)
+                done_count += 1
+                if progress_cb:
+                    try:
+                        await progress_cb(done_count, total_u)
+                    except Exception:
+                        pass
+
+            await asyncio.gather(*(_fetch_badges_universe(r, u, g) for r, u, g in unique_universes))
+
+        final_ids: List[int] = []
+        seen_final: Set[int] = set()
+        processed_games: List[str] = []
+        for rid, uid, gname in unique_universes:
+            label, b_list, has_overlap = per_game_results.get(uid, (f"{gname} ({rid})", [], False))
+            if has_overlap:
+                skipped_games.append(label)
+                continue
+            processed_games.append(label)
+            for bid in b_list:
+                if bid not in seen_final and bid not in checked_badge_ids:
+                    seen_final.add(bid)
+                    final_ids.append(bid)
+
+        csv_out = ", ".join(str(x) for x in final_ids)
+        return {
+            "csv": csv_out,
+            "ids": final_ids,
+            "skipped_games": skipped_games,
+            "processed_games": processed_games,
+            "unresolved_ids": unresolved_ids,
+        }
+
+    async def get_paid_gamepasses_by_game_ids(self, game_ids_csv: str, user_id: Optional[int] = None) -> str:
+        """Принимает ID игр через запятую -> возвращает ID платных геймпассов через запятую."""
+        res = await self.fetch_paid_gamepasses_for_games(game_ids_csv, user_id=user_id)
+        return res["csv"]
+
+    async def get_all_badges_by_game_ids(self, game_ids_csv: str, user_id: Optional[int] = None) -> str:
+        """Принимает ID игр через запятую -> возвращает ID абсолютно всех бейджей через запятую."""
+        res = await self.fetch_all_badges_for_games(game_ids_csv, user_id=user_id)
+        return res["csv"]
     RARE_ITEM_PATTERNS = [
         'valkyrie', 'valk',
         '8 bit crown', '8-bit crown', '8 bit royal crown', '8-bit royal crown',

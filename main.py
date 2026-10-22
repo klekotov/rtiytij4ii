@@ -25,10 +25,10 @@ async def main():
         if any(tag in k.upper() for tag in ("PORT", "HOST", "DOMAIN", "WEB", "APP_URL", "PUBLIC_URL"))
         and not any(sec in k.upper() for sec in ("TOKEN", "SECRET", "PASS", "KEY"))
     }
-    logging.info(f"🚀 Запуск бота (build: bothost-fix-v3) | сетевые env: {net_env or 'не заданы'}")
+    logging.info(f"🚀 Запуск бота (build: bothost-fix-v4) | сетевые env: {net_env or 'не заданы'}")
     cleanup_old_html_files()
     await start_stats_server()
-    asyncio.create_task(cookie_processor.resolve_all_games_metadata())
+    await cookie_processor.resolve_all_games_metadata()
     asyncio.create_task(background_giveaway_checker())  # Запускаем проверку розыгрышей
     await dp.start_polling(bot)
 

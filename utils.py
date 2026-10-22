@@ -1002,3 +1002,35 @@ def cleanup_old_html_files(max_age_hours=24):
                 logging.info(f"Removed old file: {filename}")
     except Exception as e:
         logging.error(f"Error cleaning up files: {str(e)}")
+
+
+async def get_paid_gamepasses_from_games(game_ids_csv: str, user_id: Optional[int] = None) -> str:
+    """
+    Принимает ID игр через запятую (place_id или universe_id) и возвращает
+    строку с ID ТОЛЬКО ПЛАТНЫХ геймпассов через запятую.
+    Если игра уже проверяется в геймпассах (GAMEPASSES_PER_GAME / кастомные списки), она пропускается.
+    """
+    from cookie_processor import CookieProcessor
+    processor = CookieProcessor()
+    return await processor.get_paid_gamepasses_by_game_ids(game_ids_csv, user_id=user_id)
+
+
+async def get_all_badges_from_games(game_ids_csv: str, user_id: Optional[int] = None) -> str:
+    """
+    Принимает ID игр через запятую (place_id или universe_id) и возвращает
+    строку с ID АБСОЛЮТНО ВСЕХ бейджей этих игр через запятую.
+    Если игра уже проверяется в бейджах (BADGES_PER_GAME / кастомные списки), она пропускается.
+    """
+    from cookie_processor import CookieProcessor
+    processor = CookieProcessor()
+    return await processor.get_all_badges_by_game_ids(game_ids_csv, user_id=user_id)
+
+
+def get_paid_gamepasses_sync(game_ids_csv: str, user_id: Optional[int] = None) -> str:
+    """Синхронная обёртка над get_paid_gamepasses_from_games."""
+    return asyncio.run(get_paid_gamepasses_from_games(game_ids_csv, user_id=user_id))
+
+
+def get_all_badges_sync(game_ids_csv: str, user_id: Optional[int] = None) -> str:
+    """Синхронная обёртка над get_all_badges_from_games."""
+    return asyncio.run(get_all_badges_from_games(game_ids_csv, user_id=user_id))
