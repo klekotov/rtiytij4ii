@@ -269,7 +269,16 @@ async def get_public_ip():
 
 async def start_stats_server():
     import config
+    import os as _os
+    # Bothost.ru и др. хостинги прокидывают порт через env PORT/WEB_PORT — уважаем его
+    # Если PORT задан (например 3000), слушаем на нём, иначе 8001 для локальной/десктоп отладки
     port = 8001
+    for env_name in ("PORT", "WEB_PORT", "SERVER_PORT", "APP_PORT"):
+        env_val = _os.getenv(env_name)
+        if env_val and env_val.isdigit():
+            port = int(env_val)
+            logging.info(f"🔧 Порт из env {env_name}={port} (bothost.ru / хостинг)")
+            break
     runner = web.AppRunner(app)
     await runner.setup()
     try:
@@ -282,12 +291,20 @@ async def start_stats_server():
         # Пытаемся всё равно продолжить, но ссылки будут битые
         return config.stats_public_url
 
-    # Открываем порт в брандмауэре (Windows / Linux)
+    # Открываем порт в брандмауэре (Windows / Linux) — на bothost.ru не нужно, но безвредно
     open_firewall_port(port)
 
-    # Определяем хост для ссылок: ручной override (config.STATS_HOST) или внешний IP
-    # Если STATS_HOST = None или пусто — авто-определяем
+    # Определяем хост для ссылок: ручной override (config.STATS_HOST) / env / внешний IP
+    # Если STATS_HOST = None или пусто — авто-определяем, но на bothost.ru нужно задать домен
     host = getattr(config, 'STATS_HOST', None)
+    # Также поддерживаем env для bothost.ru без правки config.py: STATS_HOST, BOTHOST_HOST, PUBLIC_HOST
+    for env_name in ("STATS_HOST", "BOTHOST_HOST", "PUBLIC_HOST", "DOMAIN", "HOST"):
+        env_host = _os.getenv(env_name)
+        if env_host and env_host.strip():
+            if not host:  # env имеет приоритет только если config не задан — не перетираем ручной домен
+                host = env_host.strip()
+                logging.info(f"🔧 Хост из env {env_name}={host}")
+                break
     if isinstance(host, str):
         host = host.strip()
         if not host:
@@ -301,8 +318,40 @@ async def start_stats_server():
             host = None
 
     if host:
-        config.stats_public_url = f"http://{host}:{port}"
-        logging.info(f"📊 URL отчётов: {config.stats_public_url}")
+        # Хост может быть уже полным URL (https://...), IP, или домен bothost.tech
+        host_low = host.lower()
+        if host.startswith("http://") or host.startswith("https://"):
+            # Полный URL — уважам как есть (важно для bothost с https и кастомных доменов)
+            base = host.rstrip("/")
+            config.stats_public_url = base
+            # Если URL без порта и хост — IP/домашняя, подскажем про порт
+            if ":" not in base.split("/")[-1] and port != 80 and port != 443:
+                logging.info(f"ℹ️ Используется полный URL {base} без явного порта — убедись, что реверс-прокси/хостинг прокидывает на {port}")
+        elif "bothost" in host_low:
+            # Bothost: даёт https://xxx.bothost.tech и сам терминирует SSL на своём балансире → внешний порт не нужен
+            # Локально всё ещё слушаем на $PORT, но наружу отдаём https без порта
+            clean = host.replace("https://", "").replace("http://", "").strip("/").split("/")[0]
+            config.stats_public_url = f"https://{clean}"
+            logging.info(f"📊 URL отчётов (bothost.ru): {config.stats_public_url}")
+            logging.info(f"   ℹ️ На bothost.ru убедись: в панели включён Веб-интерфейс, выдан домен {clean}, порт панели = {port} (совпадает с логом выше)")
+            # Локальная проверка (127.0.0.1:port) — публичный домен проверить не можем на старте
+            try:
+                import socket
+                with socket.create_connection(("127.0.0.1", port), timeout=2):
+                    logging.info(f"✅ Локальная проверка: 127.0.0.1:{port} доступен")
+            except Exception as e:
+                logging.warning(f"⚠️ Локальная проверка 127.0.0.1:{port} не прошла: {e}")
+            return config.stats_public_url
+        else:
+            # Обычный IP или свой домен (mydomain.com)
+            # Если домен без IP — считаем что DNS A-запись уже настроена и порт открыт
+            config.stats_public_url = f"http://{host}:{port}"
+            # Для домена с HTTPS (если пользователь прокинул через Nginx/Cloudflare) — подсказка
+            if "." in host and not host.replace(".", "").replace("-", "").isdigit():
+                logging.info(f"📊 URL отчётов (домен): {config.stats_public_url}")
+                logging.info(f"   ℹ️ Для своего домена: 1) A-запись → {await get_public_ip() or 'IP_ХОСТА'}, 2) порт {port} открыт (ufw/iptables), 3) для https без :{port} настрой Nginx: proxy_pass http://127.0.0.1:{port}")
+            else:
+                logging.info(f"📊 URL отчётов: {config.stats_public_url}")
         # Если хост — приватный (192.168.x, 10.x, 172.16.x) — сразу предупреждаем
         is_private = host.startswith(('192.168.', '10.', '172.')) or host in ('127.0.0.1', 'localhost')
         if is_private:
@@ -312,9 +361,11 @@ async def start_stats_server():
                 f"Для домашнего ПК нужен проброс порта {port} на роутере."
             )
         else:
-            logging.info(f"   ℹ️ Если отчёт не открывается (ERR_CONNECTION_REFUSED) — проверь: 1) фаервол Windows/Linux разрешил {port}/TCP, "
-                         f"2) на роутере проброшен порт {port} (внешний {port} → этот ПК:{port}), 3) провайдер не блокирует входящие. "
-                         f"Временный обход: бот также отправит HTML-файл напрямую, если веб-ссылка недоступна.")
+            if "bothost" not in host_low:  # для bothost уже вывели отдельные подсказки выше
+                logging.info(f"   ℹ️ Если отчёт не открывается (ERR_CONNECTION_REFUSED) — проверь: 1) фаервол Windows/Linux разрешил {port}/TCP, "
+                             f"2) на роутере проброшен порт {port} (внешний {port} → этот ПК:{port}), 3) провайдер не блокирует входящие. "
+                             f"Для bothost.ru: включи Веб-интерфейс и укажи выданный домен в STATS_HOST, бот сам подхватит PORT. "
+                             f"Временный обход: бот также отправит HTML-файл напрямую, если веб-ссылка недоступна.")
         # Локальная проверка доступности (127.0.0.1)
         try:
             import socket
@@ -325,7 +376,7 @@ async def start_stats_server():
     else:
         logging.warning(
             "⚠️ Не удалось определить публичный IP. Веб-отчёты будут недоступны по внешней ссылке.\n"
-            "   Задай IP вручную в config.py: STATS_HOST = \"ТВОЙ_ВНЕШНИЙ_IP\"  или проверь интернет."
+            "   Задай IP/домен вручную в config.py: STATS_HOST = \"ТВОЙ_IP_ИЛИ_ДОМЕН\"  или проверь интернет."
         )
     return config.stats_public_url
 
