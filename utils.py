@@ -271,44 +271,66 @@ async def start_stats_server():
     import config
     import os as _os
     # Bothost.ru и др. хостинги прокидывают порт через env PORT/WEB_PORT — уважаем его
-    # Если PORT задан (например 3000), слушаем на нём, иначе 8001 для локальной/десктоп отладки
+    # Если PORT задан (например 3000), слушаем на нём + на стандартных контейнерных портах
     port = 8001
-    for env_name in ("PORT", "WEB_PORT", "SERVER_PORT", "APP_PORT"):
+    env_port_used = None
+    for env_name in ("PORT", "WEB_PORT", "SERVER_PORT", "APP_PORT", "HTTP_PORT"):
         env_val = _os.getenv(env_name)
-        if env_val and env_val.isdigit():
-            port = int(env_val)
+        if env_val and env_val.strip().isdigit():
+            port = int(env_val.strip())
+            env_port_used = env_name
             logging.info(f"🔧 Порт из env {env_name}={port} (bothost.ru / хостинг)")
             break
-    runner = web.AppRunner(app)
-    await runner.setup()
-    try:
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        await site.start()
-        logging.info(f"🌐 Сервер отчётов слушает 0.0.0.0:{port}")
-    except OSError as e:
-        logging.error(f"❌ Не удалось запустить сервер отчётов на порту {port}: {e}")
-        logging.error(f"   Проверь, не занят ли порт: Windows: netstat -ano | findstr :{port}  Linux: sudo ss -tulpn | grep {port}")
-        # Пытаемся всё равно продолжить, но ссылки будут битые
-        return config.stats_public_url
 
-    # Открываем порт в брандмауэре (Windows / Linux) — на bothost.ru не нужно, но безвредно
-    open_firewall_port(port)
-
-    # Определяем хост для ссылок: ручной override (config.STATS_HOST) / env / внешний IP
-    # Если STATS_HOST = None или пусто — авто-определяем, но на bothost.ru нужно задать домен
+    # Определяем хост для ссылок заранее, чтобы понять режим работы (контейнер / bothost / домашний ПК)
     host = getattr(config, 'STATS_HOST', None)
-    # Также поддерживаем env для bothost.ru без правки config.py: STATS_HOST, BOTHOST_HOST, PUBLIC_HOST
     for env_name in ("STATS_HOST", "BOTHOST_HOST", "PUBLIC_HOST", "DOMAIN", "HOST"):
         env_host = _os.getenv(env_name)
         if env_host and env_host.strip():
-            if not host:  # env имеет приоритет только если config не задан — не перетираем ручной домен
+            if not host:
                 host = env_host.strip()
                 logging.info(f"🔧 Хост из env {env_name}={host}")
                 break
     if isinstance(host, str):
-        host = host.strip()
-        if not host:
-            host = None
+        host = host.strip() or None
+
+    is_container = _os.path.exists('/.dockerenv') or _os.path.abspath(__file__).startswith('/app/')
+    is_bothost_or_cloud = is_container or bool(env_port_used) or ('bothost' in (host or '').lower())
+
+    candidate_ports = [port]
+    if is_bothost_or_cloud:
+        # В Docker-контейнере Bothost панель «Веб-интерфейс» может проксировать на 80/3000/5000/8000/8001/8080
+        # Один AppRunner легко слушает сразу все свободные порты без накладных расходов
+        for extra_p in (8001, 3000, 8000, 8080, 5000, 80):
+            if extra_p not in candidate_ports:
+                candidate_ports.append(extra_p)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    bound_ports: List[int] = []
+    for idx, p in enumerate(candidate_ports):
+        try:
+            site = web.TCPSite(runner, '0.0.0.0', p)
+            await site.start()
+            bound_ports.append(p)
+        except OSError as e:
+            if idx == 0:
+                logging.warning(f"⚠️ Основной порт {p} занят/недоступен ({e}), пробую запасные порты...")
+            else:
+                logging.debug(f"Доп. порт {p} пропущен: {e}")
+
+    config.stats_server_ports = bound_ports
+    if not bound_ports:
+        logging.error(f"❌ Не удалось запустить сервер отчётов ни на одном порту ({candidate_ports})")
+        return config.stats_public_url
+
+    port = bound_ports[0]
+    logging.info(f"🌐 Сервер отчётов слушает 0.0.0.0 на портах: {bound_ports}")
+
+    # Открываем порт в брандмауэре только вне Docker-контейнера
+    if not is_container:
+        open_firewall_port(port)
+
     if not host:
         detected = await get_public_ip()
         if detected:
@@ -384,10 +406,68 @@ async def check_stats_accessible(url: str, timeout: float = 3.0) -> bool:
     """Проверяет, открывается ли URL отчётов извне (best-effort)."""
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            async with session.get(url, ssl=False, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                 return resp.status in (200, 304)
     except Exception:
         return False
+
+
+async def probe_stats_report(filename: str, url: str) -> tuple[bool, str]:
+    """
+    Проверяет:
+    1) HTML реально сохранён в TEMP_DIR;
+    2) локальный aiohttp-сервер отдаёт HTTP 200 на 127.0.0.1:{bound_port}/{filename};
+    3) если url внешний (например https://*.bothost.tech/...), проверяет HTTP-статус внешнего URL.
+    Возвращает (ok, reason).
+    """
+    import config
+    filepath = _resolve_temp_file_path(filename, {'.html'}, require_exists=True)
+    if not filepath:
+        logging.warning(f"⚠️ HTML-отчёт не найден на диске: {filename}")
+        return False, "HTML не сохранён на диск"
+
+    ports = list(getattr(config, 'stats_server_ports', None) or [])
+    if not ports:
+        for env_name in ("PORT", "WEB_PORT", "SERVER_PORT", "APP_PORT", "HTTP_PORT"):
+            ev = os.getenv(env_name)
+            if ev and ev.strip().isdigit():
+                ports = [int(ev.strip())]
+                break
+        if not ports:
+            ports = [8001]
+
+    local_port = ports[0]
+    local_probe_url = f"http://127.0.0.1:{local_port}/{filename}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(local_probe_url, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
+                if resp.status != 200:
+                    logging.warning(f"🔴 Локальный веб-сервер вернул HTTP {resp.status} на {local_probe_url}")
+                    return False, f"локальный сервер вернул HTTP {resp.status}"
+    except Exception as e:
+        logging.warning(f"🔴 Локальный веб-сервер 127.0.0.1:{local_port} не отвечает ({e}) | слушает порты: {ports}")
+        return False, f"локальный порт {local_port} не отвечает"
+
+    if not url or "127.0.0.1" in url or "localhost" in url:
+        return False, "не настроен публичный домен/IP"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, ssl=False, timeout=aiohttp.ClientTimeout(total=3.5)) as resp:
+                if resp.status in (200, 304):
+                    logging.info(f"✅ Веб-отчёт доступен по внешней ссылке (HTTP {resp.status}): {url}")
+                    return True, "OK"
+                logging.warning(
+                    f"⚠️ Локальный сервер ОК (порты {ports}), но внешний URL {url} вернул HTTP {resp.status}. "
+                    f"Проверь в панели Bothost вкладку «Веб-интерфейс» (порт любой из {ports})."
+                )
+                return False, f"внешний домен вернул HTTP {resp.status} (сервер слушает {ports})"
+    except Exception as e:
+        logging.warning(
+            f"⚠️ Локальный сервер ОК (порты {ports}), но внешний URL {url} не проверился изнутри ({type(e).__name__}: {e}). "
+            f"На всякий случай продублируем HTML файлом."
+        )
+        return False, f"{type(e).__name__}"
 
 def save_stats_html(filename: str, html_content: str) -> bool:
     try:

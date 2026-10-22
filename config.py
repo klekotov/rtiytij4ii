@@ -1,3 +1,4 @@
+import os
 import tempfile
 
 TELEGRAM_TOKEN = "8926815398:AAGBD0BBKSoB7QK2B0c0NPOphEDL8Z6p2Y4" # Замените на ваш токен
@@ -671,7 +672,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </script>
 </body>
 </html>"""
-TEMP_DIR = "temp"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMP_DIR = os.path.join(BASE_DIR, "temp")
 # Хост для ссылок на отчёты. None = автоопределение. Можно указать IP, домен или полный URL.
 # Примеры:
 #   STATS_HOST = None                      # авто-определит публичный IP (подходит не для bothost.ru)
@@ -681,6 +683,7 @@ TEMP_DIR = "temp"
 #   STATS_HOST = "https://mydomain.com"    # если стоит Nginx/Cloudflare с HTTPS без порта
 STATS_HOST = "bot-1792475546-1397-s4234sfdsfsdf.bothost.tech"  # bothost.ru домен для этого бота (выдаёт панель → Веб-интерфейс)
 stats_public_url = "http://127.0.0.1:8001"  # перезаписывается в start_stats_server() / из PORT env → https://bot-1792475546-1397...
+stats_server_ports = []  # реальные локальные порты, которые слушает сервер отчётов
 CHECK_PARAMS = {
     'price': 'Price ($)',
     'balance': 'Balance',

@@ -30,10 +30,10 @@ import json
 from database import get_user_game_overrides
 import textwrap # Добавлен импорт для dedent
 from config import bot
-from config import TELEGRAM_TOKEN, CRYPTO_PAY_TOKEN, PLANS, CRYPTO_PAY_API_URL, MANUAL_USDT_RATE, CHECK_PARAMS, GAMES, BADGES_PER_GAME, GAMEPASSES_PER_GAME, CHANNEL_ID, CHANNEL_URL, REF_PERCENT, BOT_USERNAME # Импорт из config.py
-from database import get_user_settings, save_user_settings, is_subscribed, get_profile_info, get_global_stats, get_all_users, get_user_custom_configs, add_user_custom_config, add_subscription, is_trial_enabled, set_trial_enabled, has_claimed_trial, set_claimed_trial, set_referrer, get_ref_balance, add_ref_earning, get_ref_count, create_withdrawal_request, get_pending_withdrawals, complete_withdrawal, get_user_ad_broadcast_enabled, set_user_ad_broadcast_enabled, increment_user_checked, increment_user_freshed, get_user_activity # Импорт из database.py
+from config import TELEGRAM_TOKEN, CRYPTO_PAY_TOKEN, PLANS, CRYPTO_PAY_API_URL, MANUAL_USDT_RATE, CHECK_PARAMS, GAMES, BADGES_PER_GAME, GAMEPASSES_PER_GAME, CHANNEL_ID, CHANNEL_URL, REF_PERCENT, BOT_USERNAME, TEMP_DIR # Импорт из config.py
+from database import get_user_settings, save_user_settings, is_subscribed, get_profile_info, get_global_stats, get_all_users, get_user_custom_configs, add_user_custom_config, add_subscription, is_trial_enabled, set_trial_enabled, has_claimed_trial, set_claimed_trial, set_referrer, get_ref_balance, add_ref_earning, get_ref_count, create_withdrawal_request, get_pending_withdrawals, complete_withdrawal, get_referrer_id, get_user_ad_broadcast_enabled, set_user_ad_broadcast_enabled, increment_user_checked, increment_user_freshed, get_user_activity # Импорт из database.py
 from cookie_processor import CookieProcessor # Импорт из cookie_processor.py
-from utils import load_proxies, save_stats_html, get_stats_url # Импорт из utils.py
+from utils import load_proxies, save_stats_html, get_stats_url, probe_stats_report # Импорт из utils.py
 from database import (
 
     cursor, conn, get_sponsor_channels, add_sponsor_channel, remove_sponsor_channel, clear_sponsor_channels, can_claim_bonus, update_global_stats, update_global_cookies_checked, update_global_cookies_freshed,
@@ -3694,34 +3694,11 @@ async def process_file(message: Message, state: FSMContext):
             html = cookie_processor.generate_stats_html(
                 summary, valid_stats, game_summary, selected_checks, playtime_summary
             )
-            filename = f"{uuid.uuid4()}.html"
-            html_saved = save_stats_html(filename, html)
-            url = get_stats_url(filename)
-            # --- Проверка доступности веб-отчёта (bothost-aware, без хардкода :8001) ---
-            html_path = os.path.join("temp", filename) if html_saved else None
-            web_accessible = bool(html_saved and html_path and os.path.isfile(html_path))
-            # определяем реальный порт сервера (bothost даёт PORT в env, иначе 8001)
-            _effective_port = 8001
-            try:
-                import os as _os2
-                for _env in ("PORT", "WEB_PORT", "SERVER_PORT", "APP_PORT"):
-                    _ev = _os2.getenv(_env)
-                    if _ev and _ev.isdigit():
-                        _effective_port = int(_ev)
-                        break
-            except Exception:
-                pass
-            if web_accessible:
-                try:
-                    import socket
-                    with socket.create_connection(("127.0.0.1", _effective_port), timeout=1.5):
-                        pass
-                except Exception as _e:
-                    web_accessible = False
-                    logging.warning(f"🔴 Веб-сервер 127.0.0.1:{_effective_port} не отвечает ({_e}). Отчёты {url} не откроются — порт закрыт/не тот PORT.")
-                    logging.warning(f"Bothost: открой Веб-интерфейс в панели, порт панели = {_effective_port}; Локально: netsh advfirewall firewall add rule name=RobloxChecker_Stats_{_effective_port} dir=in action=allow protocol=TCP localport={_effective_port} | sudo ufw allow {_effective_port}/tcp")
-            else:
-                logging.warning("⚠️ HTML не сохранился на диск — веб-ссылка будет битой, отправим фолбек файлом")
+            report_filename = f"{uuid.uuid4()}.html"
+            html_saved = save_stats_html(report_filename, html)
+            url = get_stats_url(report_filename)
+            html_path = os.path.join(TEMP_DIR, report_filename) if html_saved else None
+            web_accessible, web_probe_reason = await probe_stats_report(report_filename, url)
      
             # ИСПРАВЛЕННЫЕ РАСЧЁТЫ СТАТИСТИКИ
             valid = summary['valid']
@@ -3807,32 +3784,30 @@ async def process_file(message: Message, state: FSMContext):
             if selected_checks.get('price', True) and batch_price and batch_price > 0:
                 stats_text += "\n" + get_text(user_lang, "checker_results_price", price=batch_price)
 
-            # Если веб недоступен — расширяем текст подсказкой и добавим кнопку-скачать
+            # Если веб недоступен — расширяем текст аккуратной подсказкой и ниже отправляем HTML файлом
             if not web_accessible:
-                # hint уже в логах, дублируем в сообщение (ru/en)
+                is_bothost_url = "bothost" in (url or "").lower()
                 if user_lang == "ru":
-                    stats_text += (
-                        "\n\n<blockquote>⚠️ <b>Веб-отчёт может не открыться (ERR_CONNECTION_REFUSED)</b> — порт <code>8001</code> закрыт. "
-                        "HTML-файл продублирован ниже. Чтобы починить веб: запусти бота от админа / <code>sudo ufw allow 8001/tcp</code> + проброс порта на роутере.</blockquote>"
-                    )
+                    if is_bothost_url:
+                        stats_text += (
+                            f"\n\n<blockquote>ℹ️ <b>HTML-отчёт также отправлен файлом ниже</b> ({web_probe_reason}). "
+                            "Если кнопка не открывается — проверь в панели Bothost вкладку «Веб-интерфейс» (порт <code>8001</code> или <code>3000</code>).</blockquote>"
+                        )
+                    else:
+                        stats_text += (
+                            f"\n\n<blockquote>⚠️ <b>Веб-отчёт продублирован HTML-файлом ниже</b> ({web_probe_reason}).</blockquote>"
+                        )
                 else:
                     stats_text += (
-                        "\n\n<blockquote>⚠️ <b>Web report may fail (ERR_CONNECTION_REFUSED)</b> — port <code>8001</code> is closed. "
-                        "HTML file duplicated below. Fix: run as admin / <code>sudo ufw allow 8001/tcp</code> + router forward.</blockquote>"
+                        f"\n\n<blockquote>ℹ️ <b>HTML report also attached below as a file</b> ({web_probe_reason}).</blockquote>"
                     )
 
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=get_text(user_lang, "btn_web_report"), url=url)],
-            ])
-            # Дополнительная кнопка: если веб сомнительный, предложить сразу скачать html
-            # (реализуется через отправку файла ниже, но кнопку можно добавить как url к localhost для теста)
-            try:
-                local_url = f"http://127.0.0.1:8001/{filename}"
-                # Показываем локальную ссылку только если публичная != локальной (домашний ПК)
-                if "127.0.0.1" not in url and "localhost" not in url:
-                    keyboard.inline_keyboard.append([InlineKeyboardButton(text="🔧 Локально (127.0.0.1)", url=local_url)])
-            except Exception:
-                pass
+            # Кнопка веб-отчёта: Telegram запрещает localhost/127.0.0.1 в URL инлайн-кнопок (иначе BadRequest)
+            keyboard = None
+            if url and url.startswith(("http://", "https://")) and "127.0.0.1" not in url and "localhost" not in url:
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=get_text(user_lang, "btn_web_report"), url=url)],
+                ])
 
             await bot.delete_message(message.chat.id, progress_msg.message_id)
 
@@ -4030,12 +4005,12 @@ async def process_file(message: Message, state: FSMContext):
                         for i in range(0, len(playtime_media), 10):
                             await bot.send_media_group(message.chat.id, media=playtime_media[i:i+10])
 
-            # --- Фолбек: если веб-отчёт недоступен (ERR_CONNECTION_REFUSED), продублировать HTML файлом ---
+            # --- Фолбек: если веб-отчёт недоступен, продублировать HTML файлом ---
             if not web_accessible and html_path and os.path.isfile(html_path):
                 try:
                     await message.answer_document(
-                        FSInputFile(html_path, filename=f"report_{filename}"),
-                        caption="📄 Веб-отчёт продублирован файлом (веб-сервер недоступен — см. подсказку выше)"
+                        FSInputFile(html_path, filename=f"report_{report_filename}"),
+                        caption="📄 Интерактивный HTML-отчёт (открой в браузере)"
                     )
                 except Exception as fe:
                     logging.warning(f"Не удалось отправить HTML-фолбек: {fe}")
