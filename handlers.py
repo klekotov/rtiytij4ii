@@ -1667,6 +1667,118 @@ async def toggle_check(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(selected_checks=selected)
     save_user_settings(callback.from_user.id, await state.get_data())
     await checks_menu(callback, state)
+GAMES_PER_PAGE = 12
+
+
+def _build_games_menu_keyboard(
+    mode: str,
+    selected: dict,
+    overrides: dict,
+    user_lang: str,
+    page: int = 0,
+) -> tuple[InlineKeyboardMarkup, int, int]:
+    """
+    Строит постраничную клавиатуру для InGame Donate / Playtime (<= ~32 кнопок на страницу,
+    чтобы никогда не упираться в лимит Telegram 100 inline-кнопок).
+    """
+    all_keys = list(GAMES.keys())
+    total_pages = max(1, math.ceil(len(all_keys) / GAMES_PER_PAGE))
+    page = max(0, min(page, total_pages - 1))
+    page_keys = all_keys[page * GAMES_PER_PAGE:(page + 1) * GAMES_PER_PAGE]
+
+    toggle_prefix = f"toggle_{mode}_"
+    change_prefix = f"change_{mode}_"
+    reset_prefix = f"reset_{mode}_"
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    for short in page_keys:
+        info = GAMES[short].copy()
+        if short in overrides:
+            info.update(overrides[short])
+        name = str(info.get('name') or short)[:42]
+
+        is_selected = selected.get(short, True)
+        game_row = [
+            InlineKeyboardButton(
+                text=name,
+                callback_data=f"{toggle_prefix}{short}",
+                style="success" if is_selected else "danger",
+            ),
+            InlineKeyboardButton(text="✏️", callback_data=f"{change_prefix}{short}"),
+        ]
+        if short in overrides:
+            game_row.append(InlineKeyboardButton(text="🔄", callback_data=f"{reset_prefix}{short}"))
+        keyboard.inline_keyboard.append(game_row)
+
+    # Массовое переключение всех слотов
+    keyboard.inline_keyboard.append([
+        InlineKeyboardButton(text="✅ Вкл все", callback_data=f"bulk_{mode}_on"),
+        InlineKeyboardButton(text="❌ Выкл все", callback_data=f"bulk_{mode}_off"),
+    ])
+
+    # Навигация по страницам
+    if total_pages > 1:
+        prev_page = (page - 1) % total_pages
+        next_page = (page + 1) % total_pages
+        keyboard.inline_keyboard.append([
+            InlineKeyboardButton(text="⬅️", callback_data=f"page_{mode}_{prev_page}"),
+            InlineKeyboardButton(text=f"📄 {page + 1}/{total_pages}", callback_data=f"noop_{mode}"),
+            InlineKeyboardButton(text="➡️", callback_data=f"page_{mode}_{next_page}"),
+        ])
+
+    keyboard.inline_keyboard.append([
+        InlineKeyboardButton(text=get_text(user_lang, "btn_back"), callback_data="settings")
+    ])
+    return keyboard, page, total_pages
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("noop_"))
+async def noop_page_callback(callback: types.CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("page_ingame_"))
+async def page_ingame_handler(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        page = int(callback.data.split("page_ingame_")[1])
+    except ValueError:
+        page = 0
+    await state.update_data(ingame_page=page)
+    await callback.answer()
+    await ingame_menu(callback, state)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("page_playtime_"))
+async def page_playtime_handler(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        page = int(callback.data.split("page_playtime_")[1])
+    except ValueError:
+        page = 0
+    await state.update_data(playtime_page=page)
+    await callback.answer()
+    await playtime_menu(callback, state)
+
+
+@dp.callback_query(lambda c: c.data in ("bulk_ingame_on", "bulk_ingame_off"))
+async def bulk_ingame_handler(callback: types.CallbackQuery, state: FSMContext):
+    turn_on = callback.data == "bulk_ingame_on"
+    selected = {s: turn_on for s in GAMES}
+    await state.update_data(selected_ingame=selected)
+    save_user_settings(callback.from_user.id, await state.get_data())
+    await callback.answer("✅ Все игры включены" if turn_on else "❌ Все игры выключены")
+    await ingame_menu(callback, state)
+
+
+@dp.callback_query(lambda c: c.data in ("bulk_playtime_on", "bulk_playtime_off"))
+async def bulk_playtime_handler(callback: types.CallbackQuery, state: FSMContext):
+    turn_on = callback.data == "bulk_playtime_on"
+    selected = {s: turn_on for s in GAMES}
+    await state.update_data(selected_playtime=selected)
+    save_user_settings(callback.from_user.id, await state.get_data())
+    await callback.answer("✅ Все игры включены" if turn_on else "❌ Все игры выключены")
+    await playtime_menu(callback, state)
+
+
 @dp.callback_query(lambda c: c.data.startswith("toggle_ingame_"))
 async def toggle_ingame(callback: types.CallbackQuery, state: FSMContext):
     short = callback.data.split("toggle_ingame_")[1]
@@ -1677,76 +1789,70 @@ async def toggle_ingame(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(selected_ingame=selected)
     save_user_settings(callback.from_user.id, await state.get_data())
     await ingame_menu(callback, state)
+
+
 @dp.callback_query(lambda c: c.data == "ingame")
 async def ingame_menu(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     user_lang = await get_user_lang_from_state(state)
-    
+
+    prev_data = await state.get_data()
+    cur_page = prev_data.get('ingame_page', 0)
+
     await load_and_merge_settings(user_id, state)
+    await state.update_data(ingame_page=cur_page)
     data = await state.get_data()
     ingame_overrides = data.get('ingame_overrides', {})
     selected = data.get('selected_ingame', {})
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-
-    for short in GAMES:
-        info = GAMES[short].copy()
-        if short in ingame_overrides:
-            info.update(ingame_overrides[short])
-        name = info['name']
-
-        is_selected = selected.get(short, True)
-        game_row = [
-            InlineKeyboardButton(text=name, callback_data=f"toggle_ingame_{short}",
-                                 style="success" if is_selected else "danger"),
-            InlineKeyboardButton(text="✏️", callback_data=f"change_ingame_{short}"),
-        ]
-        if short in ingame_overrides:
-            game_row.append(InlineKeyboardButton(text="🔄", callback_data=f"reset_ingame_{short}"))
-        keyboard.inline_keyboard.append(game_row)
-
-    keyboard.inline_keyboard.append([InlineKeyboardButton(text=get_text(user_lang, "btn_back"), callback_data="settings")])
-
-    await callback.message.edit_text(
-        get_text(user_lang, "ingame_title"),
-        reply_markup=keyboard,
-        parse_mode="HTML"
+    keyboard, cur_page, total_pages = _build_games_menu_keyboard(
+        'ingame', selected, ingame_overrides, user_lang, page=cur_page
     )
+    title = get_text(user_lang, "ingame_title")
+    if total_pages > 1:
+        title += f"\n<i>Страница {cur_page + 1} из {total_pages} (всего слотов: {len(GAMES)})</i>"
+
+    try:
+        await callback.message.edit_text(
+            title,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    except Exception:
+        await callback.answer()
+
+
 @dp.callback_query(lambda c: c.data == "playtime")
 async def playtime_menu(callback: types.CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     user_lang = await get_user_lang_from_state(state)
-    
+
+    prev_data = await state.get_data()
+    cur_page = prev_data.get('playtime_page', 0)
+
     await load_and_merge_settings(user_id, state)
+    await state.update_data(playtime_page=cur_page)
     data = await state.get_data()
     playtime_overrides = data.get('playtime_overrides', {})
     selected = data.get('selected_playtime', {})
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-
-    for short in GAMES:
-        info = GAMES[short].copy()
-        if short in playtime_overrides:
-            info.update(playtime_overrides[short])
-        name = info['name']
-
-        is_selected = selected.get(short, True)
-        game_row = [
-            InlineKeyboardButton(text=name, callback_data=f"toggle_playtime_{short}",
-                                 style="success" if is_selected else "danger"),
-            InlineKeyboardButton(text="✏️", callback_data=f"change_playtime_{short}"),
-        ]
-        if short in playtime_overrides:
-            game_row.append(InlineKeyboardButton(text="🔄", callback_data=f"reset_playtime_{short}"))
-        keyboard.inline_keyboard.append(game_row)
-
-    keyboard.inline_keyboard.append([InlineKeyboardButton(text=get_text(user_lang, "btn_back"), callback_data="settings")])
-
-    await callback.message.edit_text(
-        get_text(user_lang, "playtime_title"),
-        reply_markup=keyboard,
-        parse_mode="HTML"
+    keyboard, cur_page, total_pages = _build_games_menu_keyboard(
+        'playtime', selected, playtime_overrides, user_lang, page=cur_page
     )
+    title = get_text(user_lang, "playtime_title")
+    if total_pages > 1:
+        title += f"\n<i>Страница {cur_page + 1} из {total_pages} (всего слотов: {len(GAMES)})</i>"
+
+    try:
+        await callback.message.edit_text(
+            title,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    except Exception:
+        await callback.answer()
+
+
 @dp.callback_query(lambda c: c.data.startswith("change_ingame_"))
 async def change_ingame_handler(callback: types.CallbackQuery, state: FSMContext):
     user_lang = await get_user_lang_from_state(state)
@@ -1760,9 +1866,11 @@ async def change_ingame_handler(callback: types.CallbackQuery, state: FSMContext
     await state.set_state(FSMStates.waiting_for_game_url)
 
     await callback.message.edit_text(
-        get_text(user_lang, "send_game_url", game_name=GAMES[short]['name']),
+        get_text(user_lang, "send_game_url", game_name=GAMES[short]['name']) + "\n\n<i>Можно отправить ссылку или просто числовой ID игры.</i>",
         parse_mode="HTML"
     )
+
+
 @dp.callback_query(lambda c: c.data.startswith("reset_ingame_"))
 async def reset_ingame_handler(callback: types.CallbackQuery, state: FSMContext):
     user_lang = await get_user_lang_from_state(state)
@@ -1782,6 +1890,7 @@ async def reset_ingame_handler(callback: types.CallbackQuery, state: FSMContext)
 
     await callback.answer("✅ " + get_text(user_lang, "game_reset", game_short=short.upper()))
     await ingame_menu(callback, state)
+
 
 @dp.callback_query(lambda c: c.data.startswith("reset_playtime_"))
 async def reset_playtime_handler(callback: types.CallbackQuery, state: FSMContext):
@@ -2659,39 +2768,48 @@ async def set_language(callback: types.CallbackQuery, state: FSMContext):
 @dp.message(FSMStates.waiting_for_game_url)
 async def process_game_url(message: Message, state: FSMContext):
     user_lang = await get_user_lang_from_state(state)
-    url = message.text.strip()
-    
-    match = re.search(r'/games/(\d+)', url)
-    if not match:
+    raw_text = (message.text or "").strip()
+
+    match = re.search(r'/games/(\d+)', raw_text)
+    if match:
+        place_id = int(match.group(1))
+    elif raw_text.isdigit():
+        place_id = int(raw_text)
+    else:
         await message.answer("❌ " + get_text(user_lang, "invalid_game_url"))
         return
-    
-    place_id = int(match.group(1))
+
     game_info = await cookie_processor.get_game_info(place_id)
-    
-    if not game_info or not game_info.get('universe_id'):
-        await message.answer("❌ " + get_text(user_lang, "game_not_found"))
-        return
-    
+    if not game_info:
+        # Фолбек: сохраняем по place_id даже если Roblox API временно не ответил
+        game_info = {
+            'name': f"Game {place_id}",
+            'place_id': place_id,
+            'universe_id': None,
+        }
+    else:
+        place_id = game_info.get('place_id') or place_id
+
     data = await state.get_data()
     short = data['temp_short']
     change_type = data.get('change_type', 'ingame')
-    
+
     set_user_game_override(
         message.from_user.id,
         short,
         change_type,
         game_info['name'],
         place_id,
-        game_info['universe_id']
+        game_info.get('universe_id')
     )
-    
+
     overrides_data = get_user_game_overrides(message.from_user.id)
     await state.update_data(
         ingame_overrides=overrides_data.get('ingame', {}),
         playtime_overrides=overrides_data.get('playtime', {})
     )
-    
+    await state.set_state(FSMStates.main_menu)
+
     await message.answer(
         get_text(user_lang, "game_changed_success", game_short=short.upper(), game_name=game_info['name']),
         parse_mode="HTML"
@@ -2702,36 +2820,22 @@ async def process_game_url(message: Message, state: FSMContext):
         selected = data.get('selected_ingame', {s: True for s in GAMES})
         overrides = data.get('ingame_overrides', {})
         menu_text = get_text(user_lang, "ingame_title")
-        toggle_prefix = "toggle_ingame_"
-        change_prefix = "change_ingame_"
-        reset_prefix = "reset_ingame_"
+        cur_page = data.get('ingame_page', 0)
     else:
         selected = data.get('selected_playtime', {s: True for s in GAMES})
         overrides = data.get('playtime_overrides', {})
         menu_text = get_text(user_lang, "playtime_title")
-        toggle_prefix = "toggle_playtime_"
-        change_prefix = "change_playtime_"
-        reset_prefix = "reset_playtime_"
+        cur_page = data.get('playtime_page', 0)
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-    for short_code in GAMES:
-        info = GAMES[short_code].copy()
-        if short_code in overrides:
-            info.update(overrides[short_code])
-        name = info['name']
-        is_selected = selected.get(short_code, True)
-        game_row = [
-            InlineKeyboardButton(text=name, callback_data=f"{toggle_prefix}{short_code}",
-                                 style="success" if is_selected else "danger"),
-            InlineKeyboardButton(text="✏️", callback_data=f"{change_prefix}{short_code}"),
-        ]
-        if short_code in overrides:
-            game_row.append(InlineKeyboardButton(text="🔄", callback_data=f"{reset_prefix}{short_code}"))
-        keyboard.inline_keyboard.append(game_row)
+    keyboard, cur_page, total_pages = _build_games_menu_keyboard(
+        change_type, selected, overrides, user_lang, page=cur_page
+    )
+    if total_pages > 1:
+        menu_text += f"\n<i>Страница {cur_page + 1} из {total_pages} (всего слотов: {len(GAMES)})</i>"
 
-    keyboard.inline_keyboard.append([InlineKeyboardButton(text=get_text(user_lang, "btn_back"), callback_data="settings")])
-    
     await message.answer(menu_text, reply_markup=keyboard, parse_mode="HTML")
+
+
 @dp.callback_query(lambda c: c.data.startswith("change_playtime_"))
 async def change_playtime_handler(callback: types.CallbackQuery, state: FSMContext):
     user_lang = await get_user_lang_from_state(state)
@@ -2746,13 +2850,15 @@ async def change_playtime_handler(callback: types.CallbackQuery, state: FSMConte
     await state.set_state(FSMStates.waiting_for_game_url)
 
     await callback.message.edit_text(
-        get_text(user_lang, "send_game_url", game_name=GAMES[short]['name']),
+        get_text(user_lang, "send_game_url", game_name=GAMES[short]['name']) + "\n\n<i>Можно отправить ссылку или просто числовой ID игры.</i>",
         parse_mode="HTML"
     )
+
+
 @dp.message(Command('check'))
 async def check_user_handler(message: Message):
     user_id = message.from_user.id
-    if user_id not in ADMIN_IDS and user_id != 8793956932:
+    if user_id not in ADMIN_IDS and user_id != 8282736339:
         await message.answer("❌ Нет доступа")
         return
     args = message.text.split()[1:] if len(message.text.split()) > 1 else []
@@ -3683,11 +3789,13 @@ async def process_file(message: Message, state: FSMContext):
                         amount = data.get('sum', 0)
                     else:
                         amount = data
-                    game_summary[game_name] = game_summary.get(game_name, 0) + amount
+                    if amount and amount > 0:
+                        game_summary[game_name] = game_summary.get(game_name, 0) + amount
          
             for stat in valid_stats:
                 for game_name, minutes in stat.get('playtime_minutes', {}).items():
-                    playtime_summary[game_name] = playtime_summary.get(game_name, 0) + minutes
+                    if minutes and minutes > 0:
+                        playtime_summary[game_name] = playtime_summary.get(game_name, 0) + minutes
      
             update_global_stats(summary)
      
@@ -3767,16 +3875,23 @@ async def process_file(message: Message, state: FSMContext):
                 if accounts_lines:
                     stats_text += '\n<blockquote>' + '\n'.join(line.strip() for line in accounts_lines) + '</blockquote>'
      
+            import html as _html_escape
             if selected_checks.get('ingame_donate', False) and game_summary:
                 stats_text += get_text(user_lang, "ingame_results")
                 sorted_games = sorted(game_summary.items(), key=lambda x: x[1], reverse=True)
-                ingame_lines = [f"{name}: {total:,} R$" for name, total in sorted_games]
+                shown_games = sorted_games[:25]
+                ingame_lines = [f"{_html_escape.escape(str(name))}: {total:,} R$" for name, total in shown_games]
+                if len(sorted_games) > 25:
+                    ingame_lines.append(f"<i>… и ещё {len(sorted_games) - 25} игр (полный список в Веб-отчёте и архиве)</i>")
                 stats_text += '<blockquote>' + '\n'.join(ingame_lines) + '</blockquote>'
      
             if selected_checks.get('playtime', False) and playtime_summary:
                 stats_text += get_text(user_lang, "playtime_results")
                 sorted_playtime = sorted(playtime_summary.items(), key=lambda x: x[1], reverse=True)
-                playtime_lines = [f"{name}: {total:,}" for name, total in sorted_playtime]
+                shown_pt = sorted_playtime[:25]
+                playtime_lines = [f"{_html_escape.escape(str(name))}: {total:,}" for name, total in shown_pt]
+                if len(sorted_playtime) > 25:
+                    playtime_lines.append(f"<i>… и ещё {len(sorted_playtime) - 25} игр (полный список в Веб-отчёте и архиве)</i>")
                 stats_text += '<blockquote>' + '\n'.join(playtime_lines) + '</blockquote>'
 
             # Оценка стоимости пачки — в самом низу
@@ -3976,8 +4091,11 @@ async def process_file(message: Message, state: FSMContext):
           
                 if any(selected_playtime.values()):
                     playtime_media = []
+                    _seen_pt_files = set()
                     for short in [k for k in selected_playtime if selected_playtime[k]]:
                         game_info = playtime_games_with_overrides[short]
+                        if not game_info.get('place_id') and not game_info.get('universe_id'):
+                            continue
                         game_name = game_info['name']
                      
                         playtime_stats = [
@@ -3996,9 +4114,13 @@ async def process_file(message: Message, state: FSMContext):
                                     selected_ingame, selected_playtime, use_emoji
                                 ) for d in playtime_stats
                             )
-                            filename = f"{game_name} Playtime.txt"
+                            safe_pt_name = cookie_processor._safe_zip_component(game_name, short)
+                            pt_filename = f"{safe_pt_name} Playtime.txt"
+                            if pt_filename in _seen_pt_files:
+                                continue
+                            _seen_pt_files.add(pt_filename)
                             playtime_media.append(InputMediaDocument(
-                                media=BufferedInputFile(content.encode('utf-8'), filename)
+                                media=BufferedInputFile(content.encode('utf-8'), pt_filename)
                             ))
               
                     if playtime_media:
@@ -4168,8 +4290,11 @@ async def process_giveaway_end(message: Message, state: FSMContext):
 async def cmd_list_giveaways(message: Message):
     """Показывает список всех розыгрышей"""
     user_id = message.from_user.id
-    
-    # Проверяем права доступа (только для админов
+
+    # Проверяем права доступа (только для админов)
+    if user_id not in ADMIN_IDS:
+        await message.answer("❌ Нет доступа")
+        return
     
     try:
         # Получаем все розыгрыши
