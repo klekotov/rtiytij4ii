@@ -67,12 +67,63 @@ except ImportError:
             return {"proxy": proxy_url}
 request_semaphore = asyncio.Semaphore(max(8, min(MAX_CONCURRENT_REQUESTS, 256)))
 class CookieProcessor:
+    @staticmethod
+    def _load_fresher_proxies():
+        """Загружает прокси для статистики из proxies.txt (если есть), иначе хардкод-фолбек."""
+        try:
+            from utils import load_proxies
+            import os
+            if os.path.exists("proxies.txt"):
+                proxies = load_proxies("proxies.txt")
+                if proxies:
+                    logging.info(f"✅ FRESHER_PROXY загружен из proxies.txt: {len(proxies)} прокси (хардкод SPRNG7 пропускается)")
+                    return proxies
+        except Exception as e:
+            logging.warning(f"⚠️ Не удалось загрузить proxies.txt для FRESHER_PROXY: {e}")
+        # fallback — старый хардкод (оставлен для совместимости, но мёртв при 407)
+        return [
+            "http://SPRNG7:XC1WtT@196.18.15.170:8000",
+            "http://SPRNG7:XC1WtT@196.18.13.7:8000",
+            "http://SPRNG7:XC1WtT@196.18.12.59:8000",
+            "http://SPRNG7:XC1WtT@196.18.13.210:8000",
+            "http://SPRNG7:XC1WtT@196.18.13.130:8000",
+            "http://SPRNG7:XC1WtT@196.18.14.85:8000",
+            "http://SPRNG7:XC1WtT@196.18.15.111:8000",
+            "http://SPRNG7:XC1WtT@196.18.13.186:8000",
+            "http://SPRNG7:XC1WtT@196.18.15.117:8000",
+            "http://SPRNG7:XC1WtT@196.19.11.227:8000",
+            "http://SPRNG7:XC1WtT@196.19.120.80:8000",
+            "http://SPRNG7:XC1WtT@196.19.120.87:8000",
+            "http://SPRNG7:XC1WtT@196.19.121.12:8000",
+            "http://SPRNG7:XC1WtT@196.19.121.117:8000",
+            "http://SPRNG7:XC1WtT@196.19.120.133:8000",
+            "http://SPRNG7:XC1WtT@196.19.122.18:8000",
+            "http://SPRNG7:XC1WtT@196.19.121.153:8000",
+            "http://SPRNG7:XC1WtT@196.19.123.79:8000",
+            "http://SPRNG7:XC1WtT@196.19.120.59:8000",
+            "http://SPRNG7:XC1WtT@196.19.120.58:8000",
+            "http://SPRNG7:XC1WtT@196.19.120.98:8000",
+            "http://SPRNG7:XC1WtT@196.19.120.11:8000",
+            "http://SPRNG7:XC1WtT@196.19.122.76:8000",
+        ]
+
     def __init__(self):
         self.temp_dir = TEMP_DIR
         self._ensure_dirs()
+        # Динамический FRESHER_PROXY: proxies.txt имеет приоритет над хардкодом (фикс 407)
+        try:
+            loaded = self._load_fresher_proxies()
+            # Переопределяем и классовую переменную, и инстанс
+            self.FRESHER_PROXY = loaded
+            CookieProcessor.FRESHER_PROXY = loaded
+        except Exception:
+            pass
         self._fresher_cycle = itertools.cycle(self.FRESHER_PROXY) if self.FRESHER_PROXY else None
 
     def _next_fresher_proxy(self, fallback=None):
+        # Фикс 407: приоритет у прокси из пула (новый proxies.txt), хардкод только если fallback пустой
+        if fallback:
+            return fallback
         if self._fresher_cycle:
             return next(self._fresher_cycle)
         return fallback
@@ -590,7 +641,31 @@ class CookieProcessor:
                         continue
                     logging.error(f"❌ Ошибка подключения при получении доната: {str(e)}")
                     break
+                except aiohttp.ClientHttpProxyError as e:
+                    if getattr(e, 'status', None) == 407 or "407" in str(e):
+                        logging.warning(f"🔑 407 донат ...{donate_proxy[-18:] if donate_proxy else 'None'} — ротация")
+                        if attempt < page_max_retries:
+                            await asyncio.sleep(page_delay)
+                            page_delay = min(page_delay * 1.5, 8)
+                            donate_proxy = self._next_fresher_proxy(proxy_url)
+                            continue
+                        logging.error(f"❌ 407 донат после {attempt + 1} попыток: {e}")
+                        break
+                    if attempt < page_max_retries:
+                        await asyncio.sleep(page_delay)
+                        page_delay = min(page_delay * 1.5, 8)
+                        donate_proxy = self._next_fresher_proxy(proxy_url)
+                        continue
+                    logging.error(f"❌ Ошибка прокси доната: {e}")
+                    break
                 except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                    if _is_proxy_auth_error(e):
+                        logging.warning(f"🔑 407 донат (ClientError) ...{donate_proxy[-18:] if donate_proxy else 'None'}: {e} — ротация")
+                        if attempt < page_max_retries:
+                            await asyncio.sleep(page_delay)
+                            page_delay = min(page_delay * 1.5, 8)
+                            donate_proxy = self._next_fresher_proxy(proxy_url)
+                            continue
                     if attempt < page_max_retries:
                         await asyncio.sleep(page_delay)
                         page_delay = min(page_delay * 1.5, 8)
@@ -599,6 +674,13 @@ class CookieProcessor:
                     logging.error(f"❌ Таймаут/ошибка доната после {attempt + 1} попыток: {str(e)}")
                     break
                 except Exception as e:
+                    if _is_proxy_auth_error(e):
+                        logging.warning(f"🔑 407 донат (generic) ...{donate_proxy[-18:] if donate_proxy else 'None'}: {e} — ротация")
+                        if attempt < page_max_retries:
+                            await asyncio.sleep(page_delay)
+                            page_delay = min(page_delay * 1.5, 8)
+                            donate_proxy = self._next_fresher_proxy(proxy_url)
+                            continue
                     logging.error(f"❌ Ошибка при получении доната: {str(e)}")
                     break
 
@@ -838,8 +920,8 @@ class CookieProcessor:
             return result
    
     async def get_playtime_task(self, session, cookie, proxy_url, result, selected_playtime):
-    # Используем рандомный прокси из FRESHER_PROXY для запросов playtime
-        proxy = self._next_fresher_proxy(None)
+    # Фикс 407: используем прокси из пула (новый proxies.txt), а не хардкод SPRNG7
+        proxy = self._next_fresher_proxy(proxy_url)
         playtime_data = await self.get_playtime(session, cookie, proxy)
         for short in selected_playtime:
             if selected_playtime[short]:
@@ -904,15 +986,15 @@ class CookieProcessor:
         except Exception as e:
             logging.warning(f"Ошибка получения settings.json в get_settings_task: {e}")
     async def get_balance_task(self, session, user_id, cookie, proxy_url, result):
-        # Используем рандомный прокси из FRESHER_PROXY
-        proxy = self._next_fresher_proxy(None)
+        # Фикс 407: используем прокси из пула (новый proxies.txt), а не хардкод SPRNG7
+        proxy = self._next_fresher_proxy(proxy_url)
         await self.get_combined_financial_data(session, user_id, cookie, proxy, result)
 
     async def get_combined_financial_data(self, session: aiohttp.ClientSession, user_id: int, cookie: str, proxy_url: str, result: Dict[str, Any]):
         try:
-            # Используем прокси из FRESHER_PROXY для запросов баланса
+            # Фикс 407: используем прокси из пула, хардкод только если вообще нет прокси
             if proxy_url is None:
-                proxy_url = self._next_fresher_proxy(None)
+                proxy_url = self._next_fresher_proxy(proxy_url)
             
             balance_data = await self._resilient_get(
                 session,
@@ -980,6 +1062,23 @@ class CookieProcessor:
                             continue
                     logging.warning(f"❌ Не удалось получить донат/пендинг (статус: {response.status}, попыток: {attempt + 1})")
                     return {"donate_year": 0, "pending": 0}
+            except aiohttp.ClientHttpProxyError as e:
+                if getattr(e, 'status', None) == 407 or "407" in str(e):
+                    logging.warning(f"🔑 407 Proxy Auth в pending_donate ...{cur_proxy[-18:] if cur_proxy else 'None'} — ротация прокси")
+                    if attempt < max_retries:
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 1.5, 8)
+                        cur_proxy = self._next_fresher_proxy(proxy_url)
+                        continue
+                    logging.error(f"❌ 407 донат/пендинг после {attempt + 1} попыток: {e}")
+                    return {"donate_year": 0, "pending": 0}
+                if attempt < max_retries:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 1.5, 8)
+                    cur_proxy = self._next_fresher_proxy(proxy_url)
+                    continue
+                logging.error(f"❌ Ошибка прокси доната/пендинга: {e}")
+                return {"donate_year": 0, "pending": 0}
             except aiohttp.ClientConnectorError as e:
                 error_str = str(e).lower()
                 if "resolve hostname" in error_str or "name or service not known" in error_str or "failed to resolve" in error_str:
@@ -993,6 +1092,13 @@ class CookieProcessor:
                 logging.error(f"❌ Ошибка получения доната и пендинга: {str(e)}")
                 return {"donate_year": 0, "pending": 0}
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                if _is_proxy_auth_error(e):
+                    logging.warning(f"🔑 407 (через ClientError) в pending_donate — ротация ...{cur_proxy[-18:] if cur_proxy else 'None'}: {e}")
+                    if attempt < max_retries:
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 1.5, 8)
+                        cur_proxy = self._next_fresher_proxy(proxy_url)
+                        continue
                 if attempt < max_retries:
                     await asyncio.sleep(delay)
                     delay = min(delay * 1.5, 8)
@@ -1001,6 +1107,13 @@ class CookieProcessor:
                 logging.error(f"❌ Таймаут/ошибка доната и пендинга после {attempt + 1} попыток: {str(e)}")
                 return {"donate_year": 0, "pending": 0}
             except Exception as e:
+                if _is_proxy_auth_error(e):
+                    logging.warning(f"🔑 407 в pending_donate (generic) ...{cur_proxy[-18:] if cur_proxy else 'None'}: {e}")
+                    if attempt < max_retries:
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 1.5, 8)
+                        cur_proxy = self._next_fresher_proxy(proxy_url)
+                        continue
                 logging.error(f"❌ Ошибка получения доната и пендинга: {str(e)}")
                 return {"donate_year": 0, "pending": 0}
         return {"donate_year": 0, "pending": 0}
@@ -1036,6 +1149,21 @@ class CookieProcessor:
                             cur_proxy = self._next_fresher_proxy(proxy_url)
                             continue
                     return None
+            except aiohttp.ClientHttpProxyError as e:
+                if getattr(e, 'status', None) == 407 or "407" in str(e):
+                    logging.warning(f"🔑 407 в _resilient_get ...{cur_proxy[-18:] if cur_proxy else 'None'} — ротация")
+                    if attempt < max_retries:
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 1.5, 8)
+                        cur_proxy = self._next_fresher_proxy(proxy_url)
+                        continue
+                    return None
+                if attempt < max_retries:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 1.5, 8)
+                    cur_proxy = self._next_fresher_proxy(proxy_url)
+                    continue
+                return None
             except aiohttp.ClientConnectorError as e:
                 error_str = str(e).lower()
                 if "resolve hostname" in error_str or "name or service not known" in error_str or "failed to resolve" in error_str:
@@ -1046,20 +1174,34 @@ class CookieProcessor:
                     cur_proxy = self._next_fresher_proxy(proxy_url)
                     continue
                 return None
-            except (asyncio.TimeoutError, aiohttp.ClientError):
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                if _is_proxy_auth_error(e):
+                    logging.warning(f"🔑 407 в _resilient_get (ClientError) ...{cur_proxy[-18:] if cur_proxy else 'None'}: {e}")
+                    if attempt < max_retries:
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 1.5, 8)
+                        cur_proxy = self._next_fresher_proxy(proxy_url)
+                        continue
                 if attempt < max_retries:
                     await asyncio.sleep(delay)
                     delay = min(delay * 1.5, 8)
                     cur_proxy = self._next_fresher_proxy(proxy_url)
                     continue
                 return None
-            except Exception:
+            except Exception as e:
+                if _is_proxy_auth_error(e):
+                    logging.warning(f"🔑 407 в _resilient_get generic ...{cur_proxy[-18:] if cur_proxy else 'None'}: {e}")
+                    if attempt < max_retries:
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 1.5, 8)
+                        cur_proxy = self._next_fresher_proxy(proxy_url)
+                        continue
                 return None
         return None
 
     async def get_cards_task(self, session, cookie, proxy_url, result):
-    # Используем рандомный прокси из FRESHER_PROXY для запросов карт
-        proxy = self._next_fresher_proxy(None)
+    # Фикс 407: прокси из пула, а не хардкод SPRNG7
+        proxy = self._next_fresher_proxy(proxy_url)
         
         # Инициализируем словари для хранения карт по сетям и PayPal профилей
         result['cards_by_network'] = {}
@@ -1212,8 +1354,8 @@ class CookieProcessor:
                 break
         return owned_badges
     async def get_rap_task(self, session, user_id, cookie, proxy_url, result):
-    # Используем рандомный прокси из FRESHER_PROXY для запросов RAP
-        proxy = self._next_fresher_proxy(None)
+    # Фикс 407: прокси из пула, а не хардкод SPRNG7
+        proxy = self._next_fresher_proxy(proxy_url)
         rap_total, top_items, rare_items = await self.check_rap(session, user_id, cookie, proxy)
         result['rap'] = rap_total
         result['top_rap_items'] = top_items
@@ -1324,7 +1466,7 @@ class CookieProcessor:
         next_cursor = None
         
         if proxy_url is None:
-            proxy_url = self._next_fresher_proxy(None)
+            proxy_url = self._next_fresher_proxy(proxy_url)
         
         try:
             while True:
@@ -1366,12 +1508,27 @@ class CookieProcessor:
                             next_cursor = data.get('nextPageCursor')
                             success = True
 
+                    except aiohttp.ClientHttpProxyError as e:
+                        if getattr(e, 'status', None) == 407 or "407" in str(e):
+                            logging.warning(f"🔑 407 при проверке RAP ...{proxy_url[-18:] if proxy_url else 'None'} — ротация прокси")
+                            proxy_url = self._next_fresher_proxy(proxy_url)
+                            retries += 1
+                            await asyncio.sleep(5)
+                            continue
+                        retries += 1
+                        logging.warning(f"⚠️ Прокси ошибка RAP (попытка {retries}/5): {str(e)}, жду 5 секунд...")
+                        proxy_url = self._next_fresher_proxy(proxy_url)
+                        await asyncio.sleep(5)
+                        continue
                     except asyncio.TimeoutError:
                         retries += 1
                         logging.warning(f"⏰ Таймаут при проверке RAP (попытка {retries}/5), жду 5 секунд...")
                         await asyncio.sleep(5)
                         continue
                     except Exception as e:
+                        if _is_proxy_auth_error(e):
+                            logging.warning(f"🔑 407 при запросе RAP (попытка {retries+1}/5): {str(e)} — ротация")
+                            proxy_url = self._next_fresher_proxy(proxy_url)
                         retries += 1
                         logging.warning(f"⚠️ Ошибка при запросе RAP (попытка {retries}/5): {str(e)}, жду 5 секунд...")
                         await asyncio.sleep(5)
@@ -1385,7 +1542,10 @@ class CookieProcessor:
                     break
 
         except Exception as e:
-            logging.error(f"❌ Неожиданная ошибка проверки RAP: {str(e)}")
+            if _is_proxy_auth_error(e):
+                logging.warning(f"🔑 407 в RAP (outer): {e}")
+            else:
+                logging.error(f"❌ Неожиданная ошибка проверки RAP: {str(e)}")
 
         top_items.sort(key=lambda x: x['rap'], reverse=True)
         top_items = top_items[:3]
@@ -1395,8 +1555,8 @@ class CookieProcessor:
         result['korblox'] = False
         result['headless'] = False
         
-        # Используем рандомный прокси из FRESHER_PROXY
-        proxy = self._next_fresher_proxy(None)
+        # Фикс 407: прокси из пула, а не хардкод SPRNG7
+        proxy = self._next_fresher_proxy(proxy_url)
         
         # Создаем отдельную сессию для проверки редких предметов с выбранным прокси
         try:
@@ -1599,12 +1759,25 @@ class CookieProcessor:
                 # Успешно получили все данные
                 return total_visits
                 
+            except aiohttp.ClientHttpProxyError as e:
+                if getattr(e, 'status', None) == 407 or "407" in str(e):
+                    logging.warning(f"🔑 407 Proxy Auth при получении визитов ...{proxy[-18:] if proxy else 'None'} — ротация")
+                    proxy = self._next_fresher_proxy(proxy_url)
+                    retry_count += 1
+                else:
+                    logging.error(f"❌ Ошибка прокси при получении визитов: {str(e)}")
+                    proxy = self._next_fresher_proxy(proxy_url)
+                    retry_count += 1
             except aiohttp.ClientConnectorError as e:
                 error_str = str(e).lower()
                 if "resolve hostname" in error_str or "name or service not known" in error_str or "failed to resolve" in error_str:
                     logging.warning(f"🚫 DNS-ошибка при получении визитов — пропускаем: {str(e)}")
                     return total_visits
-                logging.error(f"❌ Ошибка подключения при получении визитов: {str(e)}")
+                if _is_proxy_auth_error(e):
+                    logging.warning(f"🔑 407 при получении визитов (Connector) ...{proxy[-18:] if proxy else 'None'}: {e}")
+                    proxy = self._next_fresher_proxy(proxy_url)
+                else:
+                    logging.error(f"❌ Ошибка подключения при получении визитов: {str(e)}")
                 retry_count += 1
                 
             except asyncio.TimeoutError:
@@ -1612,7 +1785,11 @@ class CookieProcessor:
                 retry_count += 1
                 
             except Exception as e:
-                logging.error(f"❌ Неожиданная ошибка при получении визитов: {str(e)}")
+                if _is_proxy_auth_error(e):
+                    logging.warning(f"🔑 407 при получении визитов (generic) ...{proxy[-18:] if proxy else 'None'}: {e} — ротация")
+                    proxy = self._next_fresher_proxy(proxy_url)
+                else:
+                    logging.error(f"❌ Неожиданная ошибка при получении визитов: {str(e)}")
                 retry_count += 1
             
             if retry_count < max_retries:
