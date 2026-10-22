@@ -679,8 +679,8 @@ TEMP_DIR = "temp"
 #   STATS_HOST = "mybot.bothost.tech"      # ✅ для bothost.ru — вкл. Веб-интерфейс в панели, укажи выданный домен
 #   STATS_HOST = "mydomain.com"            # свой домен (A-запись → IP хоста, порт 8001 должен быть открыт)
 #   STATS_HOST = "https://mydomain.com"    # если стоит Nginx/Cloudflare с HTTPS без порта
-STATS_HOST = None  # None = авто (для bothost.ru укажи домен вида xxx.bothost.tech)
-stats_public_url = "http://127.0.0.1:8001"  # перезаписывается в start_stats_server() / из PORT env
+STATS_HOST = "bot-1792475546-1397-s4234sfdsfsdf.bothost.tech"  # bothost.ru домен для этого бота (выдаёт панель → Веб-интерфейс)
+stats_public_url = "http://127.0.0.1:8001"  # перезаписывается в start_stats_server() / из PORT env → https://bot-1792475546-1397...
 CHECK_PARAMS = {
     'price': 'Price ($)',
     'balance': 'Balance',
