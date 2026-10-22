@@ -77,13 +77,24 @@ class ProxyPool:
                 continue
             return p
 
-    def release(self, proxy: Optional[str], success: bool):
+    def report_auth_failure(self, proxy: Optional[str]):
+        """407 — мгновенно выводит прокси из ротации (креды неверные, ждать нет смысла)."""
+        if not self.enabled or not proxy or proxy in self._disabled:
+            return
+        self._disabled.add(proxy)
+        self._fails[proxy] = self.max_fails
+        tail = proxy[-18:] if len(proxy) > 18 else proxy
+        logging.error(f"🔑 407 Прокси ...{tail} отключён на {self.cooldown*2}с (auth failed — проверь логин/пароль webshare)")
+        asyncio.create_task(self._enable_later(proxy, long=True))
+
+    def release(self, proxy: Optional[str], success: bool, auth_failed: bool = False):
         """Возвращает слот в пул и обновляет здоровье прокси."""
         if not self.enabled or proxy is None:
             return
         if proxy in self._disabled:
-            # слот отключённого прокси в оборот не возвращаем (он дренируется)
             return
+        if auth_failed:
+            return self.report_auth_failure(proxy)
 
         if success:
             self._fails[proxy] = 0
@@ -102,11 +113,10 @@ class ProxyPool:
         else:
             self._q.put_nowait(proxy)
 
-    async def _enable_later(self, proxy: str):
-        await asyncio.sleep(self.cooldown)
+    async def _enable_later(self, proxy: str, long: bool = False):
+        await asyncio.sleep(self.cooldown * (2 if long else 1))
         self._disabled.discard(proxy)
         self._fails[proxy] = 0
-        # возвращаем ровно per слотов прокси обратно в ротацию
         for _ in range(self.per):
             self._q.put_nowait(proxy)
         tail = proxy[-18:] if len(proxy) > 18 else proxy

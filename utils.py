@@ -538,6 +538,128 @@ def parse_proxy_line(raw_line: str) -> Optional[str]:
         return _parse_without_at(line, scheme)
 
 
+def get_proxy_aiohttp_params(proxy_url: Optional[str]) -> dict:
+    """
+    Возвращает kwargs для aiohttp: {"proxy": clean_url, "proxy_auth": BasicAuth}.
+    Критично для 407: aiohttp в некоторых версиях не берёт auth из URL,
+    нужно передавать proxy_auth отдельно.
+    Поддерживает http/https/socks5 (для socks5 нужен aiohttp_socks).
+    """
+    if not proxy_url:
+        return {}
+    try:
+        import aiohttp
+        parsed = urllib.parse.urlparse(proxy_url)
+        scheme = (parsed.scheme or "http").lower()
+        # webshare free — всегда http, но если socks5 указан — оставляем как есть
+        # Для socks5 aiohttp нужен ProxyConnector, но пока отдаём как есть, cookie_processor попробует fallback
+        if scheme in ("socks5", "socks5h", "socks4", "socks4a"):
+            # Для SOCKS aiohttp_socks нужен отдельный коннектор, но proxy_auth всё равно нужен
+            if parsed.username:
+                user = urllib.parse.unquote(parsed.username)
+                pwd = urllib.parse.unquote(parsed.password or "")
+                auth = aiohttp.BasicAuth(user, pwd)
+                return {"proxy": proxy_url, "proxy_auth": auth, "_is_socks": True}
+            return {"proxy": proxy_url, "_is_socks": True}
+
+        if parsed.username:
+            user = urllib.parse.unquote(parsed.username)
+            pwd = urllib.parse.unquote(parsed.password or "")
+            auth = aiohttp.BasicAuth(user, pwd)
+            host = parsed.hostname or ""
+            is_ipv6 = ":" in host and not host.startswith("[")
+            had_brackets = "[" in (proxy_url or "")
+            if is_ipv6:
+                host = f"[{host}]"
+            port = parsed.port
+            clean = f"{scheme}://{host}:{port}" if port else f"{scheme}://{host}"
+            return {"proxy": clean, "proxy_auth": auth}
+        else:
+            return {"proxy": proxy_url}
+    except Exception as e:
+        logging.debug(f"get_proxy_aiohttp_params failed for {proxy_url[:40]}: {e}")
+        return {"proxy": proxy_url}
+
+
+def detect_proxy_type(proxy_url: str) -> str:
+    """Определяет тип прокси для webshare: http или socks5."""
+    if not proxy_url:
+        return "direct"
+    low = proxy_url.lower()
+    if low.startswith("socks5") or low.startswith("socks4"):
+        return "socks"
+    # webshare free — http, но если 407 — возможно socks
+    return "http"
+
+
+async def test_proxy_connectivity(proxy_url: str, timeout: int = 8) -> dict:
+    """
+    Тестирует прокси через httpbin/ip и roblox, возвращает статус.
+    Используется для диагностики 407 и определения типа прокси (webshare free).
+    """
+    import asyncio, aiohttp, ssl, time
+    result = {"proxy": _mask_proxy(proxy_url), "ok": False, "type": detect_proxy_type(proxy_url), "error": None, "latency": None}
+    # Подготавливаем SSL контекст без проверки (для тестов)
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    except Exception:
+        ctx = None
+    # Тестовые URL: сначала httpbin, потом roblox
+    test_urls = ["https://api.ipify.org?format=json", "https://www.roblox.com/my/settings/json"]
+    proxy_params = get_proxy_aiohttp_params(proxy_url)
+    is_socks = proxy_params.pop("_is_socks", False)
+    # Если SOCKS — пробуем через aiohttp_socks
+    connector = None
+    if is_socks:
+        try:
+            from aiohttp_socks import ProxyConnector
+            connector = ProxyConnector.from_url(proxy_url, ssl=ctx)
+            # Для SOCKS proxy передаётся через connector, а не proxy param
+            proxy_params = {}
+        except ImportError:
+            result["error"] = "aiohttp_socks не установлен (pip install aiohttp_socks)"
+            return result
+        except Exception as e:
+            result["error"] = f"socks connector failed: {e}"
+            return result
+    else:
+        connector = aiohttp.TCPConnector(ssl=ctx) if ctx else None
+
+    start = time.time()
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            for url in test_urls:
+                try:
+                    async with session.get(url, **proxy_params, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                        if resp.status in (200, 401, 403):  # 401 для роблокса без куки — нормально, прокси работает
+                            result["ok"] = True
+                            result["latency"] = round((time.time() - start)*1000)
+                            result["error"] = f"HTTP {resp.status} ({url})"
+                            return result
+                        elif resp.status == 407:
+                            result["error"] = "407 Proxy Auth Failed — неверный логин/пароль или IP не в вайтлисте webshare"
+                            return result
+                        else:
+                            result["error"] = f"HTTP {resp.status}"
+                except Exception as e:
+                    err = str(e).lower()
+                    if "407" in err or "proxy authentication" in err:
+                        result["error"] = "407 Proxy Auth Failed"
+                        return result
+                    # пробуем следующий URL
+                    continue
+            result["error"] = "timeout or connection failed"
+            return result
+    except Exception as e:
+        result["error"] = str(e)[:120]
+        return result
+    finally:
+        result["latency"] = round((time.time() - start)*1000) if result["latency"] is None else result["latency"]
+    return result
+
+
 def _mask_proxy(proxy_url: str) -> str:
     """Маскирует пароль для логов: http://user:***@host:port"""
     try:
@@ -554,6 +676,16 @@ def _mask_proxy(proxy_url: str) -> str:
     except Exception:
         return proxy_url[:30] + "***"
 
+
+def _extract_hostport_key(proxy_url: str) -> str:
+    """Возвращает host:port ключ для дедупликации (без credentials)."""
+    try:
+        parsed = urllib.parse.urlparse(proxy_url)
+        host = parsed.hostname or ""
+        port = parsed.port
+        return f"{host}:{port}" if port else host
+    except Exception:
+        return proxy_url
 
 def load_proxies(file_path: str) -> List[str]:
     """
@@ -573,9 +705,12 @@ def load_proxies(file_path: str) -> List[str]:
       - пароль/логин могут содержать : @ и другие спецсимволы (кодируются)
       - строки с пробелами, пустые, комментарии # пропускаются
       - дубликаты удаляются (сохраняется порядок)
+      - webshare free: дедупликация по host:port с предупреждением (одинаковые IP с разными логинами = 90% 407)
     """
     proxies: List[str] = []
     seen = set()
+    seen_hostport = set()
+    dup_ip_warned = False
     try:
         if not os.path.exists(file_path):
             logging.error(f"Файл прокси не найден: {file_path}")
@@ -593,14 +728,27 @@ def load_proxies(file_path: str) -> List[str]:
                     logging.warning(f"Прокси строка {line_num}: неподдерживаемый формат — пропущено: {raw.strip()[:80]}")
                     continue
 
-                if proxy_url not in seen:
-                    seen.add(proxy_url)
-                    proxies.append(proxy_url)
-                    logging.debug(f"Загружен прокси: {_mask_proxy(proxy_url)}")
-                else:
+                if proxy_url in seen:
                     logging.debug(f"Прокси строка {line_num}: дубликат — пропущено: {_mask_proxy(proxy_url)}")
+                    continue
+                # Дедупликация по host:port (webshare free часто дублируют IP с разными кредами -> 407)
+                hostport_key = _extract_hostport_key(proxy_url)
+                if hostport_key in seen_hostport:
+                    if not dup_ip_warned:
+                        logging.warning(f"⚠️ Обнаружены дубликаты IP:port с разными логинами (например {hostport_key}) — webshare free даёт 10 уникальных IP, а у вас {len(seen)}+ строк. Дубликаты пропускаются, иначе 407.")
+                        dup_ip_warned = True
+                    logging.debug(f"Прокси строка {line_num}: дубликат IP:port {hostport_key} — пропущено: {_mask_proxy(proxy_url)}")
+                    continue
+                seen.add(proxy_url)
+                seen_hostport.add(hostport_key)
+                proxies.append(proxy_url)
+                logging.debug(f"Загружен прокси: {_mask_proxy(proxy_url)}")
 
-        logging.info(f"Успешно загружено {len(proxies)} прокси из {file_path}")
+        # webshare free диагностика: если прокси много, но уникальных IP мало
+        if len(proxies) < len(seen) // 2:
+            logging.warning(f"⚠️ Загружено {len(proxies)} уникальных прокси из {len(seen)} строк — много дубликатов IP:port. Проверь proxies.txt: webshare free обычно 10 IP на аккаунт, не накручивай кредами.")
+
+        logging.info(f"Успешно загружено {len(proxies)} прокси из {file_path} (уникальных IP:port: {len(seen_hostport)})")
         return proxies
 
     except Exception as e:
